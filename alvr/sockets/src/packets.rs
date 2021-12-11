@@ -104,6 +104,7 @@ pub struct VideoFrameHeaderPacket {
 #[derive(Serialize, Deserialize, Default)]
 pub struct TimeSyncPacket {
     pub mode: u32,
+    pub sequence: u64,
     pub server_time: u64,
     pub client_time: u64,
     pub packets_lost_total: u64,

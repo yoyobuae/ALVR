@@ -681,6 +681,7 @@ async fn connection_pipeline() -> StrResult {
                 let mut buffer = socket_sender.new_buffer(&header, data.len())?;
                 buffer.get_mut().extend(data);
                 socket_sender.send_buffer(buffer).await.ok();
+                log::error!("send video packet");
             }
 
             Ok(())
@@ -1010,7 +1011,7 @@ async fn connection_pipeline() -> StrResult {
                         mode: data.mode,
                         serverTime: data.server_time,
                         clientTime: data.client_time,
-                        sequence: 0,
+                        sequence: data.sequence,
                         packetsLostTotal: data.packets_lost_total,
                         packetsLostInSecond: data.packets_lost_in_second,
                         averageTotalLatency: 0,

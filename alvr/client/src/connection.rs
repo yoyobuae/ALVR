@@ -1,6 +1,6 @@
 use crate::{
     connection_utils::{self, ConnectionError},
-    HapticsFeedback, TimeSync, VideoFrame, INPUT_SENDER, LEGACY_SENDER, TIME_SYNC_SENDER,
+    HapticsFeedback, TimeSync, VideoFrame, INPUT_SENDER, TIME_SYNC_SENDER,
     VIDEO_ERROR_REPORT_SENDER,
 };
 use alvr_common::{
@@ -406,6 +406,16 @@ async fn connection_pipeline(
             loop {
                 let packet = receiver.recv().await?;
 
+                if packet.had_packet_loss {
+                    log::error!("video packet loss!");
+
+                    crate::IDR_REQUEST_NOTIFIER.notify_waiters();
+
+                    continue;
+                } else {
+                    log::error!("video packet ok");
+                }
+
                 let mut buffer = vec![0_u8; mem::size_of::<VideoFrame>() + packet.buffer.len()];
                 let header = VideoFrame {
                     type_: 9, // ALVR_PACKET_TYPE_VIDEO_FRAME
@@ -456,6 +466,8 @@ async fn connection_pipeline(
                 });
 
                 legacy_receive_data_sender.lock().await.send(buffer).ok();
+
+                log::error!("haptics receive");
             }
         }
     };
@@ -656,7 +668,7 @@ async fn connection_pipeline(
                                     mode: data.mode,
                                     serverTime: data.server_time,
                                     clientTime: data.client_time,
-                                    sequence: 0,
+                                    sequence: data.sequence,
                                     packetsLostTotal: data.packets_lost_total,
                                     packetsLostInSecond: data.packets_lost_in_second,
                                     averageTotalLatency: 0,

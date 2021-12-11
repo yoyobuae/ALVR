@@ -38,7 +38,6 @@ use tokio::{runtime::Runtime, sync::mpsc, sync::Notify};
 lazy_static! {
     static ref RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
     static ref IDR_PARSED: AtomicBool = AtomicBool::new(false);
-    static ref LEGACY_SENDER: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>> = Mutex::new(None);
     static ref INPUT_SENDER: Mutex<Option<mpsc::UnboundedSender<Input>>> = Mutex::new(None);
     static ref TIME_SYNC_SENDER: Mutex<Option<mpsc::UnboundedSender<TimeSyncPacket>>> =
         Mutex::new(None);
@@ -308,6 +307,7 @@ pub unsafe extern "system" fn Java_com_polygraphene_alvr_OvrActivity_onCreateNat
         if let Some(sender) = &*TIME_SYNC_SENDER.lock() {
             let time_sync = TimeSyncPacket {
                 mode: data.mode,
+                sequence: data.sequence,
                 server_time: data.serverTime,
                 client_time: data.clientTime,
                 packets_lost_total: data.packetsLostTotal,

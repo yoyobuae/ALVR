@@ -302,6 +302,7 @@ pub unsafe extern "C" fn HmdDriverFactory(
         if let Some(sender) = &*TIME_SYNC_SENDER.lock() {
             let time_sync = TimeSyncPacket {
                 mode: data.mode,
+                sequence: data.sequence,
                 server_time: data.serverTime,
                 client_time: data.clientTime,
                 packets_lost_total: data.packetsLostTotal,
