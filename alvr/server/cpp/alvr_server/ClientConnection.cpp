@@ -33,92 +33,21 @@ ClientConnection::~ClientConnection() {
 }
 
 void ClientConnection::FECSend(uint8_t *buf, int len, uint64_t frameIndex, uint64_t videoFrameIndex) {
-	int shardPackets = CalculateFECShardPackets(len, m_fecPercentage);
-
-	int blockSize = shardPackets * ALVR_MAX_VIDEO_BUFFER_SIZE;
-
-	int dataShards = (len + blockSize - 1) / blockSize;
-	int totalParityShards = CalculateParityShards(dataShards, m_fecPercentage);
-	int totalShards = dataShards + totalParityShards;
-
-	assert(totalShards <= DATA_SHARDS_MAX);
-
-	Debug("reed_solomon_new. dataShards=%d totalParityShards=%d totalShards=%d blockSize=%d shardPackets=%d\n"
-		, dataShards, totalParityShards, totalShards, blockSize, shardPackets);
-
-	reed_solomon *rs = reed_solomon_new(dataShards, totalParityShards);
-
-	std::vector<uint8_t *> shards(totalShards);
-
-	for (int i = 0; i < dataShards; i++) {
-		shards[i] = buf + i * blockSize;
-	}
-	if (len % blockSize != 0) {
-		// Padding
-		shards[dataShards - 1] = new uint8_t[blockSize];
-		memset(shards[dataShards - 1], 0, blockSize);
-		memcpy(shards[dataShards - 1], buf + (dataShards - 1) * blockSize, len % blockSize);
-	}
-	for (int i = 0; i < totalParityShards; i++) {
-		shards[dataShards + i] = new uint8_t[blockSize];
-	}
-
-	int ret = reed_solomon_encode(rs, &shards[0], totalShards, blockSize);
-	assert(ret == 0);
-
-	reed_solomon_release(rs);
-
-	uint8_t packetBuffer[2000];
-	VideoFrame *header = (VideoFrame *)packetBuffer;
-	uint8_t *payload = packetBuffer + sizeof(VideoFrame);
-	int dataRemain = len;
+	VideoFrame header = {};
 
 	Debug("Sending video frame. trackingFrameIndex=%llu videoFrameIndex=%llu size=%d\n", frameIndex, videoFrameIndex, len);
 
-	header->type = ALVR_PACKET_TYPE_VIDEO_FRAME;
-	header->trackingFrameIndex = frameIndex;
-	header->videoFrameIndex = videoFrameIndex;
-	header->sentTime = GetTimestampUs();
-	header->frameByteSize = len;
-	header->fecIndex = 0;
-	header->fecPercentage = (uint16_t)m_fecPercentage;
-	for (int i = 0; i < dataShards; i++) {
-		for (int j = 0; j < shardPackets; j++) {
-			int copyLength = std::min(ALVR_MAX_VIDEO_BUFFER_SIZE, dataRemain);
-			if (copyLength <= 0) {
-				break;
-			}
-			memcpy(payload, shards[i] + j * ALVR_MAX_VIDEO_BUFFER_SIZE, copyLength);
-			dataRemain -= ALVR_MAX_VIDEO_BUFFER_SIZE;
+	header.type = ALVR_PACKET_TYPE_VIDEO_FRAME;
+	header.trackingFrameIndex = frameIndex;
+	header.videoFrameIndex = videoFrameIndex;
+	header.sentTime = GetTimestampUs();
+	header.frameByteSize = len;
+	header.packetCounter = videoPacketCounter;
+	videoPacketCounter++;
 
-			header->packetCounter = videoPacketCounter;
-			videoPacketCounter++;
-			VideoSend(*header, (unsigned char *)packetBuffer + sizeof(VideoFrame), copyLength);
-			m_Statistics->CountPacket(sizeof(VideoFrame) + copyLength);
-			header->fecIndex++;
-		}
-	}
-	header->fecIndex = dataShards * shardPackets;
-	for (int i = 0; i < totalParityShards; i++) {
-		for (int j = 0; j < shardPackets; j++) {
-			int copyLength = ALVR_MAX_VIDEO_BUFFER_SIZE;
-			memcpy(payload, shards[dataShards + i] + j * ALVR_MAX_VIDEO_BUFFER_SIZE, copyLength);
+	VideoSend(header, buf, len);
 
-			header->packetCounter = videoPacketCounter;
-			videoPacketCounter++;
-			
-			VideoSend(*header, (unsigned char *)packetBuffer + sizeof(VideoFrame), copyLength);
-			m_Statistics->CountPacket(sizeof(VideoFrame) + copyLength);
-			header->fecIndex++;
-		}
-	}
-
-	if (len % blockSize != 0) {
-		delete[] shards[dataShards - 1];
-	}
-	for (int i = 0; i < totalParityShards; i++) {
-		delete[] shards[dataShards + i];
-	}
+	m_Statistics->CountPacket(sizeof(VideoFrame) + len);
 }
 
 void ClientConnection::SendVideo(uint8_t *buf, int len, uint64_t frameIndex) {

@@ -481,7 +481,7 @@ async fn connection_pipeline(
                     *activity_obj as _,
                     **nal_class as _,
                     matches!(codec, CodecType::HEVC) as _,
-                    enable_fec,
+                    false,
                 );
 
                 let mut idr_request_deadline = None;
