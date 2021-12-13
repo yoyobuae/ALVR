@@ -13,9 +13,10 @@ use alvr_session::{CodecType, SessionDesc, TrackingSpace};
 use alvr_sockets::{
     spawn_cancelable, ClientConfigPacket, ClientControlPacket, ClientHandshakePacket,
     HeadsetInfoPacket, PeerType, PlayspaceSyncPacket, PrivateIdentity, ProtoControlSocket,
-    ServerControlPacket, ServerHandshakePacket, StreamSocketBuilder, VideoFrameHeaderPacket,
-    HAPTICS, INPUT, VIDEO,
+    ServerControlPacket, ServerHandshakePacket, StreamSocketBuilder, VideoFrameMetadataPacket,
+    VideoFrameShardHeader, HAPTICS, INPUT, VIDEO_FRAME_METADATA, VIDEO_FRAME_SHARDS,
 };
+use bytes::BytesMut;
 use futures::future::BoxFuture;
 use jni::{
     objects::{GlobalRef, JClass},
@@ -24,6 +25,7 @@ use jni::{
 use serde_json as json;
 use settings_schema::Switch;
 use std::{
+    collections::HashMap,
     future, mem, ptr, slice,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -398,40 +400,77 @@ async fn connection_pipeline(
     let legacy_receive_data_sender = Arc::new(Mutex::new(legacy_receive_data_sender));
 
     let video_receive_loop = {
-        let mut receiver = stream_socket
-            .subscribe_to_stream::<VideoFrameHeaderPacket, VIDEO>()
+        let mut meta_receiver = stream_socket
+            .subscribe_to_stream::<VideoFrameMetadataPacket, VIDEO_FRAME_METADATA>()
+            .await?;
+        let mut shards_receiver = stream_socket
+            .subscribe_to_stream::<VideoFrameShardHeader, VIDEO_FRAME_SHARDS>()
             .await?;
         let legacy_receive_data_sender = legacy_receive_data_sender.clone();
+        let mut next_frame_shard = None::<(u64, BytesMut)>;
         async move {
-            loop {
-                let packet = receiver.recv().await?;
-
-                if packet.had_packet_loss {
-                    log::error!("video packet loss!");
-
+            'outer: loop {
+                let metadata = meta_receiver.recv().await?;
+                if metadata.had_packet_loss {
                     crate::IDR_REQUEST_NOTIFIER.notify_waiters();
 
                     continue;
-                } else {
-                    log::error!("video packet ok");
                 }
 
-                let mut buffer = vec![0_u8; mem::size_of::<VideoFrame>() + packet.buffer.len()];
+                let mut buffer_length = 0;
+                let mut shards = vec![];
+
+                if let Some((frame_index, shard)) = next_frame_shard.take() {
+                    if frame_index == metadata.header.frame_index as u64 {
+                        buffer_length = shard.len();
+                        shards.push(shard);
+                    } else if frame_index > metadata.header.frame_index as _ {
+                        next_frame_shard = Some((frame_index, shard));
+
+                        continue;
+                    }
+                }
+
+                // Note: StreamSocket ensures that the packets are in order (even though it might
+                // drop valid packets if out of order)
+                while shards.len() < metadata.header.shard_count as _ {
+                    let shard = shards_receiver.recv().await?;
+
+                    if shard.header.frame_index == metadata.header.frame_index {
+                        buffer_length += shard.buffer.len();
+                        shards.push(shard.buffer);
+                    } else if shard.header.frame_index > metadata.header.frame_index {
+                        next_frame_shard = Some((shard.header.frame_index as _, shard.buffer));
+                        crate::IDR_REQUEST_NOTIFIER.notify_waiters();
+
+                        continue 'outer;
+                    } else {
+                        continue;
+                    }
+                }
+
+                let mut buffer = vec![0_u8; mem::size_of::<VideoFrame>() + buffer_length];
                 let header = VideoFrame {
                     type_: 9, // ALVR_PACKET_TYPE_VIDEO_FRAME
-                    packetCounter: packet.header.packet_counter,
-                    trackingFrameIndex: packet.header.tracking_frame_index,
-                    videoFrameIndex: packet.header.video_frame_index,
-                    sentTime: packet.header.sent_time,
-                    frameByteSize: packet.header.frame_byte_size,
-                    fecIndex: packet.header.fec_index,
-                    fecPercentage: packet.header.fec_percentage,
+                    packetCounter: metadata.header.frame_index,
+                    trackingFrameIndex: metadata.header.tracking_frame_index,
+                    videoFrameIndex: 0,
+                    sentTime: metadata.header.sent_time,
+                    frameByteSize: 0,
+                    fecIndex: 0,
+                    fecPercentage: 0,
                 };
 
+                let mut buffer_cursor = 0;
                 buffer[..mem::size_of::<VideoFrame>()].copy_from_slice(unsafe {
                     &mem::transmute::<_, [u8; mem::size_of::<VideoFrame>()]>(header)
                 });
-                buffer[mem::size_of::<VideoFrame>()..].copy_from_slice(&packet.buffer);
+                let mut buffer_cursor = mem::size_of::<VideoFrame>();
+                for shard in shards {
+                    let shard_length = shard.len();
+                    buffer[buffer_cursor..buffer_cursor + shard_length].copy_from_slice(&shard);
+                    buffer_cursor += shard_length;
+                }
 
                 legacy_receive_data_sender.lock().await.send(buffer).ok();
             }

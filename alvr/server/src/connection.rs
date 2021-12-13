@@ -14,7 +14,8 @@ use alvr_session::{CodecType, FrameSize, OpenvrConfig, ServerEvent};
 use alvr_sockets::{
     spawn_cancelable, ClientConfigPacket, ClientControlPacket, ControlSocketReceiver,
     ControlSocketSender, HeadsetInfoPacket, Input, PeerType, PlayspaceSyncPacket,
-    ProtoControlSocket, ServerControlPacket, StreamSocketBuilder, HAPTICS, INPUT, VIDEO,
+    ProtoControlSocket, ServerControlPacket, StreamSocketBuilder, HAPTICS, INPUT,
+    VIDEO_FRAME_METADATA, VIDEO_FRAME_SHARDS,
 };
 use futures::future::{BoxFuture, Either};
 use settings_schema::Switch;
@@ -672,15 +673,28 @@ async fn connection_pipeline() -> StrResult {
     };
 
     let video_send_loop = {
-        let mut socket_sender = stream_socket.request_stream::<_, VIDEO>().await?;
+        let mut metadata_sender = stream_socket
+            .request_stream::<_, VIDEO_FRAME_METADATA>()
+            .await?;
+        let mut shards_sender = stream_socket
+            .request_stream::<_, VIDEO_FRAME_SHARDS>()
+            .await?;
         async move {
             let (data_sender, mut data_receiver) = tmpsc::unbounded_channel();
             *VIDEO_SENDER.lock() = Some(data_sender);
 
-            while let Some((header, data)) = data_receiver.recv().await {
-                let mut buffer = socket_sender.new_buffer(&header, data.len())?;
-                buffer.get_mut().extend(data);
-                socket_sender.send_buffer(buffer).await.ok();
+            while let Some((metadata, shards)) = data_receiver.recv().await {
+                metadata_sender
+                    .send_buffer(metadata_sender.new_buffer(&metadata, 0)?)
+                    .await
+                    .ok();
+
+                for (header, data) in shards {
+                    let mut buffer = shards_sender.new_buffer(&header, data.len())?;
+                    buffer.get_mut().extend(data);
+                    shards_sender.send_buffer(buffer).await.ok();
+                }
+
                 log::error!("send video packet");
             }
 

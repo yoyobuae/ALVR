@@ -31,7 +31,8 @@ pub type StreamId = u8;
 pub const INPUT: StreamId = 0; // tracking and buttons
 pub const HAPTICS: StreamId = 1;
 pub const AUDIO: StreamId = 2;
-pub const VIDEO: StreamId = 3;
+pub const VIDEO_FRAME_METADATA: StreamId = 3;
+pub const VIDEO_FRAME_SHARDS: StreamId = 4;
 
 #[derive(Clone)]
 enum StreamSendSocket {
