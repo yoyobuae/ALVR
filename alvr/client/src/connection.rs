@@ -13,8 +13,8 @@ use alvr_session::{CodecType, SessionDesc, TrackingSpace};
 use alvr_sockets::{
     spawn_cancelable, ClientConfigPacket, ClientControlPacket, ClientHandshakePacket,
     HeadsetInfoPacket, PeerType, PlayspaceSyncPacket, PrivateIdentity, ProtoControlSocket,
-    ServerControlPacket, ServerHandshakePacket, StreamSocketBuilder, VideoFrameHeaderPacket, AUDIO,
-    HAPTICS, INPUT, VIDEO,
+    ServerControlPacket, ServerHandshakePacket, StreamReceiver, StreamSocketBuilder,
+    VideoFrameMetadataPacket, AUDIO, HAPTICS, INPUT, VIDEO_FRAME_METADATA, VIDEO_SHARD_BASE,
 };
 use futures::future::BoxFuture;
 use jni::{
@@ -24,6 +24,7 @@ use jni::{
 use serde_json as json;
 use settings_schema::Switch;
 use std::{
+    collections::HashMap,
     future, mem, ptr, slice,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -236,6 +237,8 @@ async fn connection_pipeline(
     };
     let stream_socket = Arc::new(stream_socket);
 
+    let stream_socket = Arc::new(stream_socket);
+
     info!("Connected to server");
 
     let is_connected = Arc::new(AtomicBool::new(true));
@@ -399,33 +402,86 @@ async fn connection_pipeline(
     let legacy_receive_data_sender = Arc::new(Mutex::new(legacy_receive_data_sender));
 
     let video_receive_loop = {
-        let mut receiver = stream_socket
-            .subscribe_to_stream::<VideoFrameHeaderPacket>(VIDEO)
+        let control_sender = Arc::clone(&control_sender);
+        let stream_socket = Arc::clone(&stream_socket);
+        let mut metadata_receiver = stream_socket
+            .subscribe_to_stream::<VideoFrameMetadataPacket>(VIDEO_FRAME_METADATA)
             .await?;
+        let mut shard_receivers: Vec<StreamReceiver<u64>> = vec![];
         let legacy_receive_data_sender = legacy_receive_data_sender.clone();
         async move {
-            loop {
-                let packet = receiver.recv().await?;
+            let mut shards = HashMap::new();
+            'outer: loop {
+                let metadata = metadata_receiver.recv().await?.header;
 
-                let mut buffer = vec![0_u8; mem::size_of::<VideoFrame>() + packet.buffer.len()];
+                if shard_receivers.len() < metadata.shards_count as _ {
+                    while shard_receivers.len() < metadata.shards_count as _ {
+                        shard_receivers.push(
+                            stream_socket
+                                .subscribe_to_stream::<u64>(
+                                    VIDEO_SHARD_BASE + shard_receivers.len() as u16,
+                                )
+                                .await?,
+                        );
+                    }
+
+                    control_sender
+                        .lock()
+                        .await
+                        .send(&ClientControlPacket::VideoReceiversReady)
+                        .await?;
+                }
+
+                for (index, receiver) in shard_receivers.iter_mut().enumerate() {
+                    if !shards.contains_key(&index) {
+                        loop {
+                            let shard_packet = receiver.recv().await?;
+
+                            if shard_packet.header == metadata.frame_index as u64 {
+                                shards.insert(index, shard_packet.buffer);
+
+                                break;
+                            } else if shard_packet.header < metadata.frame_index as u64 {
+                                continue;
+                            } else {
+                                shards.clear();
+                                shards.insert(index, shard_packet.buffer);
+
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                let shards_size: usize = shards.iter().map(|(_, s)| s.len()).sum();
+
+                let mut buffer = vec![0_u8; mem::size_of::<VideoFrame>() + shards_size];
                 let header = VideoFrame {
                     type_: 9, // ALVR_PACKET_TYPE_VIDEO_FRAME
-                    packetCounter: packet.header.packet_counter,
-                    trackingFrameIndex: packet.header.tracking_frame_index,
-                    videoFrameIndex: packet.header.video_frame_index,
-                    sentTime: packet.header.sent_time,
-                    frameByteSize: packet.header.frame_byte_size,
-                    fecIndex: packet.header.fec_index,
-                    fecPercentage: packet.header.fec_percentage,
+                    packetCounter: metadata.frame_index,
+                    trackingFrameIndex: metadata.tracking_frame_index,
+                    videoFrameIndex: metadata.video_frame_index,
+                    sentTime: metadata.sent_time,
+                    frameByteSize: metadata.frame_byte_size,
+                    fecIndex: metadata.fec_index,
+                    fecPercentage: metadata.fec_percentage,
                 };
 
                 buffer[..mem::size_of::<VideoFrame>()].copy_from_slice(unsafe {
                     &mem::transmute::<_, [u8; mem::size_of::<VideoFrame>()]>(header)
                 });
-                buffer[mem::size_of::<VideoFrame>()..].copy_from_slice(&packet.buffer);
+
+                let mut buffer_cursor = mem::size_of::<VideoFrame>();
+                for index in 0..shards.len() {
+                    let shard = shards.get(&index).unwrap();
+                    buffer[buffer_cursor..buffer_cursor + shard.len()].copy_from_slice(&shard);
+                    buffer_cursor += shard.len();
+                }
 
                 legacy_receive_data_sender.lock().await.send(buffer).ok();
             }
+
+            Ok(())
         }
     };
 

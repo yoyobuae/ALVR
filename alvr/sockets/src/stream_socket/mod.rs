@@ -8,7 +8,7 @@ mod tcp;
 mod throttled_udp;
 mod udp;
 
-use alvr_common::prelude::*;
+use alvr_common::{log, prelude::*};
 use alvr_session::SocketProtocol;
 use bytes::{Buf, BufMut, BytesMut};
 use futures::SinkExt;
@@ -26,7 +26,6 @@ use tokio::net;
 use tokio::sync::{mpsc, Mutex};
 use udp::{UdpStreamReceiveSocket, UdpStreamSendSocket};
 
-// todo: when const_generics reaches stable, convert this to an enum
 pub type StreamId = u16;
 
 #[derive(Clone)]

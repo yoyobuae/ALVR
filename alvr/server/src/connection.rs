@@ -14,7 +14,8 @@ use alvr_session::{CodecType, FrameSize, OpenvrConfig, ServerEvent};
 use alvr_sockets::{
     spawn_cancelable, ClientConfigPacket, ClientControlPacket, ControlSocketReceiver,
     ControlSocketSender, HeadsetInfoPacket, Input, PeerType, PlayspaceSyncPacket,
-    ProtoControlSocket, ServerControlPacket, StreamSocketBuilder, AUDIO, HAPTICS, INPUT, VIDEO,
+    ProtoControlSocket, ServerControlPacket, StreamReceiver, StreamSender, StreamSocketBuilder,
+    AUDIO, HAPTICS, INPUT, VIDEO_FRAME_METADATA, VIDEO_SHARD_BASE,
 };
 use futures::future::{BoxFuture, Either};
 use settings_schema::Switch;
@@ -28,7 +29,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{mpsc as tmpsc, Mutex},
+    sync::{mpsc as tmpsc, Mutex, Notify},
     time,
 };
 
@@ -580,7 +581,7 @@ async fn connection_pipeline() -> StrResult {
 
     let settings = SESSION_MANAGER.lock().get().to_settings();
 
-    let mut stream_socket = tokio::select! {
+    let stream_socket = tokio::select! {
         res = StreamSocketBuilder::connect_to_client(
             client_ip,
             settings.connection.stream_port,
@@ -674,16 +675,38 @@ async fn connection_pipeline() -> StrResult {
         Box::pin(future::pending())
     };
 
+    let video_receivers_ready_notifier = Arc::new(Notify::new());
+
     let video_send_loop = {
-        let mut socket_sender = stream_socket.request_stream(VIDEO).await?;
+        let stream_socket = Arc::clone(&stream_socket);
+        let video_receivers_ready_notifier = Arc::clone(&video_receivers_ready_notifier);
+        let mut metadata_sender = stream_socket.request_stream(VIDEO_FRAME_METADATA).await?;
+        let mut shard_senders: Vec<StreamSender<u64>> = vec![];
         async move {
             let (data_sender, mut data_receiver) = tmpsc::unbounded_channel();
             *VIDEO_SENDER.lock() = Some(data_sender);
 
-            while let Some((header, data)) = data_receiver.recv().await {
-                let mut buffer = socket_sender.new_buffer(&header, data.len())?;
-                buffer.get_mut().extend(data);
-                socket_sender.send_buffer(buffer).await.ok();
+            while let Some((metadata, data)) = data_receiver.recv().await {
+                metadata_sender.send(&metadata).await.ok();
+
+                if shard_senders.len() < data.len() {
+                    while shard_senders.len() < data.len() {
+                        shard_senders.push(
+                            stream_socket
+                                .request_stream(VIDEO_SHARD_BASE + shard_senders.len() as u16)
+                                .await?,
+                        );
+                    }
+
+                    video_receivers_ready_notifier.notified().await;
+                }
+
+                for (sender, shard) in shard_senders.iter_mut().zip(data) {
+                    let mut buffer =
+                        sender.new_buffer(&(metadata.frame_index as u64), shard.len())?;
+                    buffer.get_mut().extend(shard);
+                    sender.send_buffer(buffer).await.ok();
+                }
             }
 
             Ok(())
@@ -1034,6 +1057,10 @@ async fn connection_pipeline() -> StrResult {
                 Ok(ClientControlPacket::VideoErrorReport) => unsafe {
                     crate::VideoErrorReportReceive()
                 },
+                Ok(ClientControlPacket::VideoReceiversReady) => {
+                    video_receivers_ready_notifier.notify_one();
+                    log::error!("notify video streams ready");
+                }
                 Ok(_) => (),
                 Err(e) => {
                     alvr_session::log_event(ServerEvent::ClientDisconnected);

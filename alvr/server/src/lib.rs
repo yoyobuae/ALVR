@@ -15,9 +15,10 @@ use bindings::*;
 use alvr_common::{lazy_static, log, prelude::*, Haptics, TrackedDeviceType};
 use alvr_filesystem::{self as afs, Layout};
 use alvr_session::{ClientConnectionDesc, ServerEvent, SessionManager};
-use alvr_sockets::{TimeSyncPacket, VideoFrameHeaderPacket};
+use alvr_sockets::{TimeSyncPacket, VideoFrameMetadataPacket, MAX_PACKET_SIZE_BYTES};
 use parking_lot::Mutex;
 use std::{
+    cmp,
     collections::{hash_map::Entry, HashSet},
     ffi::{c_void, CStr, CString},
     net::IpAddr,
@@ -45,7 +46,7 @@ lazy_static! {
     static ref MAYBE_WINDOW: Mutex<Option<Arc<alcro::UI>>> = Mutex::new(None);
     static ref MAYBE_NEW_DASHBOARD: Mutex<Option<Arc<alvr_gui::Dashboard>>> = Mutex::new(None);
 
-    static ref VIDEO_SENDER: Mutex<Option<mpsc::UnboundedSender<(VideoFrameHeaderPacket, Vec<u8>)>>> =
+    static ref VIDEO_SENDER: Mutex<Option<mpsc::UnboundedSender<(VideoFrameMetadataPacket, Vec<Vec<u8>>)>>> =
         Mutex::new(None);
     static ref HAPTICS_SENDER: Mutex<Option<mpsc::UnboundedSender<Haptics<TrackedDeviceType>>>> =
         Mutex::new(None);
@@ -260,24 +261,38 @@ pub unsafe extern "C" fn HmdDriverFactory(
 
     extern "C" fn video_send(header: VideoFrame, buffer_ptr: *mut u8, len: i32) {
         if let Some(sender) = &*VIDEO_SENDER.lock() {
-            let header = VideoFrameHeaderPacket {
-                packet_counter: header.packetCounter,
+            let mut shards = vec![];
+            let mut buffer_cursor = 0;
+            while buffer_cursor < len as usize {
+                let shard_length = cmp::min(len as usize - buffer_cursor, MAX_PACKET_SIZE_BYTES);
+                let mut shard = vec![0; shard_length];
+
+                // use copy_nonoverlapping (aka memcpy) to avoid freeing memory allocated by C++
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        buffer_ptr.add(buffer_cursor),
+                        shard.as_mut_ptr(),
+                        shard_length,
+                    );
+                }
+
+                shards.push(shard);
+
+                buffer_cursor += shard_length
+            }
+
+            let metadata = VideoFrameMetadataPacket {
+                frame_index: header.packetCounter,
                 tracking_frame_index: header.trackingFrameIndex,
                 video_frame_index: header.videoFrameIndex,
                 sent_time: header.sentTime,
                 frame_byte_size: header.frameByteSize,
                 fec_index: header.fecIndex,
                 fec_percentage: header.fecPercentage,
+                shards_count: shards.len() as _,
             };
 
-            let mut vec_buffer = vec![0; len as _];
-
-            // use copy_nonoverlapping (aka memcpy) to avoid freeing memory allocated by C++
-            unsafe {
-                ptr::copy_nonoverlapping(buffer_ptr, vec_buffer.as_mut_ptr(), len as _);
-            }
-
-            sender.send((header, vec_buffer)).ok();
+            sender.send((metadata, shards)).ok();
         }
     }
 

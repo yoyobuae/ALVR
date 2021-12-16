@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 pub const INPUT: StreamId = 0; // tracking and buttons
 pub const HAPTICS: StreamId = 1;
 pub const AUDIO: StreamId = 2;
-pub const VIDEO: StreamId = 3;
+pub const VIDEO_FRAME_METADATA: StreamId = 3;
+pub const VIDEO_SHARD_BASE: StreamId = 4;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ClientHandshakePacket {
@@ -90,20 +91,22 @@ pub enum ClientControlPacket {
     StreamReady,
     TimeSync(TimeSyncPacket), // legacy
     VideoErrorReport,         // legacy
+    VideoReceiversReady,
     Reserved(String),
     ReservedBuffer(Vec<u8>),
 }
 
 // legacy video packet
 #[derive(Serialize, Deserialize)]
-pub struct VideoFrameHeaderPacket {
-    pub packet_counter: u32,
+pub struct VideoFrameMetadataPacket {
+    pub frame_index: u32,
     pub tracking_frame_index: u64,
     pub video_frame_index: u64,
     pub sent_time: u64,
     pub frame_byte_size: u32,
     pub fec_index: u32,
     pub fec_percentage: u16,
+    pub shards_count: u64,
 }
 
 // legacy time sync packet

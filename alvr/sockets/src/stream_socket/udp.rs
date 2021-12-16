@@ -1,7 +1,7 @@
 use super::StreamId;
 use crate::{Ldc, LOCAL_IP};
-use alvr_common::prelude::*;
-use bytes::{Bytes, BytesMut, Buf};
+use alvr_common::{log, prelude::*};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::{
     stream::{SplitSink, SplitStream},
     StreamExt,
@@ -70,6 +70,11 @@ pub async fn receive_loop(
         let stream_id = packet_bytes.get_u16();
         if let Some(enqueuer) = packet_enqueuers.lock().await.get_mut(&stream_id) {
             trace_err!(enqueuer.send(packet_bytes))?;
+        } else {
+            log::warn!(
+                "Received packet with stream {} but no associated receiver",
+                stream_id
+            );
         }
     }
 

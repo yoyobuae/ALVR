@@ -2,7 +2,7 @@ use alvr_common::{prelude::*, ALVR_NAME};
 use alvr_session::ServerEvent;
 use alvr_sockets::{
     ClientHandshakePacket, HandshakePacket, ServerHandshakePacket, CONTROL_PORT, LOCAL_IP,
-    MAX_HANDSHAKE_PACKET_SIZE_BYTES,
+    MAX_PACKET_SIZE_BYTES,
 };
 use std::{future::Future, net::IpAddr};
 use tokio::net::UdpSocket;
@@ -14,7 +14,7 @@ pub async fn search_client_loop<F: Future<Output = bool>>(
     // use naked UdpSocket + [u8] packet buffer to have more control over datagram data
     let handshake_socket = trace_err!(UdpSocket::bind((LOCAL_IP, CONTROL_PORT)).await)?;
 
-    let mut packet_buffer = [0u8; MAX_HANDSHAKE_PACKET_SIZE_BYTES];
+    let mut packet_buffer = [0u8; MAX_PACKET_SIZE_BYTES];
 
     loop {
         let (handshake_packet_size, client_address) =
