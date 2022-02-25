@@ -94,6 +94,13 @@ struct TimeSync {
     // Following value are filled by server only when mode=3.
     unsigned long long trackingRecvFrameIndex;
 };
+struct ClientStats {
+    unsigned long long targetTimestampNs;
+    unsigned long long videoDecodeNs;
+    unsigned long long renderingNs;
+    unsigned long long vsyncQueueNs;
+    unsigned long long totalPipelineLatencyNs;
+};
 struct VideoFrame {
     unsigned int type; // ALVR_PACKET_TYPE_VIDEO_FRAME
     unsigned int packetCounter;
@@ -174,6 +181,7 @@ extern "C" void RequestIDR();
 extern "C" void SetChaperone(float areaWidth, float areaHeight);
 extern "C" void InputReceive(TrackingInfo data);
 extern "C" void TimeSyncReceive(TimeSync data);
+extern "C" void ReportClientStatistics(ClientStats statistics);
 extern "C" void VideoErrorReportReceive();
 extern "C" void ShutdownSteamvr();
 

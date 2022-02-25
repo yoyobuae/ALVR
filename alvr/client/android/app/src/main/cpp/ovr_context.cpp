@@ -34,6 +34,8 @@ using namespace gl_render_utils;
 
 void (*inputSend)(TrackingInfo data);
 void (*timeSyncSend)(TimeSync data);
+void (*reportSubmit)(unsigned long long targetTimestampNs, unsigned long long vsyncQueueNs);
+unsigned long long (*getPredictionOffsetNs)();
 void (*videoErrorReportSend)();
 void (*viewsConfigSend)(EyeFov fov[2], float ipd_m);
 void (*batterySend)(unsigned long long device_path, float gauge_value, bool is_plugged);
@@ -832,6 +834,9 @@ void renderNative(long long targetTimespampNs) {
             ovrRenderer_RenderFrame(&g_ctx.Renderer, &tracking, false);
 
     LatencyCollector::Instance().rendered2(targetTimespampNs);
+
+    double vsyncQueueS = vrapi_GetPredictedDisplayTime(g_ctx.Ovr, g_ctx.ovrFrameIndex) - vrapi_GetTimeInSeconds();
+    reportSubmit(targetTimespampNs, vsyncQueueS * 1e9);
 
     const ovrLayerHeader2 *layers2[] =
             {

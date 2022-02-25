@@ -2,21 +2,17 @@
 
 use crate::{
     connection_utils::{self, ConnectionError},
-    TimeSync, VideoFrame, BATTERY_SENDER, INPUT_SENDER, TIME_SYNC_SENDER,
-    VIDEO_ERROR_REPORT_SENDER, VIEWS_CONFIG_SENDER,
+    statistics::StatisticsManager,
+    TimeSync, VideoFrame, BATTERY_SENDER, INPUT_SENDER, STATISTICS_MANAGER, STATISTICS_SENDER,
+    TIME_SYNC_SENDER, VIDEO_ERROR_REPORT_SENDER, VIEWS_CONFIG_SENDER,
 };
-use alvr_common::{
-    glam::{Quat, Vec2, Vec3},
-    log,
-    prelude::*,
-    ALVR_NAME, ALVR_VERSION,
-};
+use alvr_common::{glam::Vec2, prelude::*, ALVR_NAME, ALVR_VERSION};
 use alvr_session::{CodecType, SessionDesc};
 use alvr_sockets::{
     spawn_cancelable, ClientConfigPacket, ClientControlPacket, ClientHandshakePacket, Haptics,
     HeadsetInfoPacket, PeerType, PrivateIdentity, ProtoControlSocket, ServerControlPacket,
     ServerHandshakePacket, StreamSocketBuilder, VideoFrameHeaderPacket, AUDIO, HAPTICS, INPUT,
-    VIDEO,
+    STATISTICS, VIDEO,
 };
 use futures::future::BoxFuture;
 use jni::{
@@ -26,7 +22,7 @@ use jni::{
 use serde_json as json;
 use settings_schema::Switch;
 use std::{
-    future, mem, ptr, slice,
+    future, mem,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc as smpsc, Arc,
@@ -203,6 +199,10 @@ async fn connection_pipeline(
         session_desc.to_settings()
     };
 
+    *STATISTICS_MANAGER.lock() = Some(StatisticsManager::new(
+        settings.connection.statistics_history_size as _,
+    ));
+
     let stream_socket_builder = StreamSocketBuilder::listen_for_server(
         settings.connection.stream_port,
         settings.connection.stream_protocol,
@@ -354,6 +354,22 @@ async fn connection_pipeline(
             while let Some(input) = data_receiver.recv().await {
                 socket_sender
                     .send_buffer(socket_sender.new_buffer(&input, 0)?)
+                    .await
+                    .ok();
+            }
+
+            Ok(())
+        }
+    };
+
+    let statistics_send_loop = {
+        let mut socket_sender = stream_socket.request_stream(STATISTICS).await?;
+        async move {
+            let (data_sender, mut data_receiver) = tmpsc::unbounded_channel();
+            *STATISTICS_SENDER.lock() = Some(data_sender);
+            while let Some(stats) = data_receiver.recv().await {
+                socket_sender
+                    .send_buffer(socket_sender.new_buffer(&stats, 0)?)
                     .await
                     .ok();
             }
@@ -718,6 +734,7 @@ async fn connection_pipeline(
         res = spawn_cancelable(playspace_sync_loop) => res,
         res = spawn_cancelable(input_send_loop) => res,
         res = spawn_cancelable(time_sync_send_loop) => res,
+        res = spawn_cancelable(statistics_send_loop) => res,
         res = spawn_cancelable(video_error_report_send_loop) => res,
         res = spawn_cancelable(views_config_send_loop) => res,
         res = spawn_cancelable(battery_send_loop) => res,

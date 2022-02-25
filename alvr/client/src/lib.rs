@@ -3,6 +3,7 @@
 mod connection;
 mod connection_utils;
 mod logging_backend;
+mod statistics;
 
 #[cfg(target_os = "android")]
 mod audio;
@@ -17,14 +18,15 @@ use alvr_common::{
 };
 use alvr_session::Fov;
 use alvr_sockets::{
-    BatteryPacket, HeadsetInfoPacket, Input, LegacyController, LegacyInput, MotionData,
-    PrivateIdentity, TimeSyncPacket, ViewsConfig,
+    BatteryPacket, ClientStatistics, HeadsetInfoPacket, Input, LegacyController, LegacyInput,
+    MotionData, PrivateIdentity, TimeSyncPacket, ViewsConfig,
 };
 use jni::{
     objects::{JClass, JObject, JString},
     JNIEnv,
 };
 use parking_lot::Mutex;
+use statistics::StatisticsManager;
 use std::{
     collections::HashMap,
     ffi::CStr,
@@ -40,9 +42,12 @@ use tokio::{runtime::Runtime, sync::mpsc, sync::Notify};
 
 lazy_static! {
     static ref RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
+    static ref STATISTICS_MANAGER: Mutex<Option<StatisticsManager>> = Mutex::new(None);
     static ref IDR_PARSED: AtomicBool = AtomicBool::new(false);
     static ref INPUT_SENDER: Mutex<Option<mpsc::UnboundedSender<Input>>> = Mutex::new(None);
     static ref TIME_SYNC_SENDER: Mutex<Option<mpsc::UnboundedSender<TimeSyncPacket>>> =
+        Mutex::new(None);
+    static ref STATISTICS_SENDER: Mutex<Option<mpsc::UnboundedSender<ClientStatistics>>> =
         Mutex::new(None);
     static ref VIDEO_ERROR_REPORT_SENDER: Mutex<Option<mpsc::UnboundedSender<()>>> =
         Mutex::new(None);
@@ -304,6 +309,27 @@ pub unsafe extern "system" fn Java_com_polygraphene_alvr_OvrActivity_onCreateNat
         }
     }
 
+    extern "C" fn report_submit(target_timestamp_ns: u64, vsync_queue_ns: u64) {
+        if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
+            let timestamp = Duration::from_nanos(target_timestamp_ns);
+            stats.report_submit(timestamp, Duration::from_nanos(vsync_queue_ns));
+
+            if let Some(sender) = &*STATISTICS_SENDER.lock() {
+                if let Some(stats) = stats.summary(timestamp) {
+                    sender.send(stats).ok();
+                }
+            }
+        }
+    }
+
+    extern "C" fn get_prediction_offset_ns() -> u64 {
+        if let Some(stats) = &*STATISTICS_MANAGER.lock() {
+            stats.average_total_pipeline_latency().as_nanos() as _
+        } else {
+            0
+        }
+    }
+
     extern "C" fn video_error_report_send() {
         if let Some(sender) = &*VIDEO_ERROR_REPORT_SENDER.lock() {
             sender.send(()).ok();
@@ -350,6 +376,8 @@ pub unsafe extern "system" fn Java_com_polygraphene_alvr_OvrActivity_onCreateNat
     pathStringToHash = Some(path_string_to_hash);
     inputSend = Some(input_send);
     timeSyncSend = Some(time_sync_send);
+    reportSubmit = Some(report_submit);
+    getPredictionOffsetNs = Some(get_prediction_offset_ns);
     videoErrorReportSend = Some(video_error_report_send);
     viewsConfigSend = Some(views_config_send);
     batterySend = Some(battery_send);
@@ -392,6 +420,10 @@ pub unsafe extern "system" fn Java_com_polygraphene_alvr_OvrActivity_renderNativ
     _: JObject,
     rendered_frame_index: i64,
 ) {
+    if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
+        stats.report_frame_decoded(Duration::from_nanos(rendered_frame_index as _));
+    }
+
     renderNative(rendered_frame_index)
 }
 

@@ -226,6 +226,9 @@ void TimeSyncReceive(TimeSync data) {
         g_driver_provider.hmd->m_Listener->ProcessTimeSync(data);
     }
 }
+void ReportClientStatistics(ClientStats statistics) {
+    // todo
+}
 void VideoErrorReportReceive() {
     if (g_driver_provider.hmd && g_driver_provider.hmd->m_Listener) {
         g_driver_provider.hmd->m_Listener->OnFecFailure();

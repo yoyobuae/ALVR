@@ -178,6 +178,8 @@ extern "C" void closeSocket(void *env);
 
 extern "C" void (*inputSend)(TrackingInfo data);
 extern "C" void (*timeSyncSend)(TimeSync data);
+extern "C" void (*reportSubmit)(unsigned long long targetTimestampNs, unsigned long long vsyncQueueNs);
+extern "C" unsigned long long (*getPredictionOffsetNs)();
 extern "C" void (*videoErrorReportSend)();
 extern "C" void (*viewsConfigSend)(EyeFov fov[2], float ipd_m);
 extern "C" void (*batterySend)(unsigned long long device_path, float gauge_value, bool is_plugged);
