@@ -356,6 +356,15 @@ async fn connection_pipeline(
                     .send_buffer(socket_sender.new_buffer(&input, 0)?)
                     .await
                     .ok();
+
+                // Note: this is not the best place to report the acquired input. Instead it should
+                // be done as soon as possible (or even just before polling the input). Instead this
+                // is reported late to partially compensate for lack of network latency measurement,
+                // so the server can just use total_pipeline_latency as the postTimeoffset.
+                // This hack will be removed once poseTimeOffset can be calculated more accurately.
+                if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
+                    stats.report_input_acquired(input.target_timestamp);
+                }
             }
 
             Ok(())
@@ -476,6 +485,12 @@ async fn connection_pipeline(
                     &mem::transmute::<_, [u8; mem::size_of::<VideoFrame>()]>(header)
                 });
                 buffer[mem::size_of::<VideoFrame>()..].copy_from_slice(&packet.buffer);
+
+                if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
+                    stats.report_video_packet_received(Duration::from_nanos(
+                        packet.header.tracking_frame_index,
+                    ));
+                }
 
                 legacy_receive_data_sender.lock().await.send(buffer).ok();
             }

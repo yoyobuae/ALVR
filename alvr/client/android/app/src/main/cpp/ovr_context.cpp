@@ -541,7 +541,7 @@ std::pair<EyeFov, EyeFov> getFov() {
 // Called from TrackingThread
 void sendTrackingInfo(bool clientsidePrediction) {
     // vrapi_GetTimeInSeconds doesn't match getTimestampUs
-    uint64_t targetTimestampNs = vrapi_GetTimeInSeconds() * 1e9 + LatencyCollector::Instance().getTrackingPredictionLatency() * 1000;
+    uint64_t targetTimestampNs = vrapi_GetTimeInSeconds() * 1e9 + getPredictionOffsetNs();
     auto tracking = vrapi_GetPredictedTracking2(g_ctx.Ovr, (double)targetTimestampNs / 1e9);
 
     // sort of hacky, SteamVR will predict the position while the orientation is predicted from the client
@@ -855,7 +855,7 @@ void renderNative(long long targetTimespampNs) {
 
     LatencyCollector::Instance().submit(targetTimespampNs);
     // TimeSync here might be an issue but it seems to work fine
-    sendTimeSync();
+    // sendTimeSync();
 
     if (g_ctx.suspend) {
         LOG("submit enter suspend");

@@ -1,6 +1,6 @@
 mod logging;
 
-use semver::{Prerelease, Version};
+use semver::Version;
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
@@ -31,7 +31,7 @@ lazy_static! {
 // Note: by not having to set the requirement manually, the major version is constrained to be
 // bumped when the packet layouts or some critical behaviour has changed.
 pub fn is_version_compatible(other_version: &Version) -> bool {
-    if other_version.pre != Prerelease::EMPTY || ALVR_VERSION.pre != Prerelease::EMPTY {
+    if !other_version.pre.is_empty() || !ALVR_VERSION.pre.is_empty() {
         other_version.major == ALVR_VERSION.major
             && other_version.minor == ALVR_VERSION.minor
             && other_version.patch == ALVR_VERSION.patch
@@ -47,7 +47,7 @@ pub fn is_nightly() -> bool {
 }
 
 pub fn is_stable() -> bool {
-    ALVR_VERSION.pre == Prerelease::EMPTY && !is_nightly()
+    ALVR_VERSION.pre.is_empty() && !is_nightly()
 }
 
 // Consistent across architectures, might not be consistent across different compiler versions.
