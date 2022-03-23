@@ -23,7 +23,6 @@ pub enum SettingsEvent {
 }
 
 pub struct TabLabel {
-    name: String,
     display_name: String,
     label_state: button::State,
 }
@@ -51,7 +50,6 @@ impl SettingsPanel {
             tabs_labels = entries
                 .iter()
                 .map(|(name, _)| TabLabel {
-                    name: name.clone(),
                     display_name: name.clone(),
                     label_state: button::State::new(),
                 })

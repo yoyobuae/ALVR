@@ -3,6 +3,7 @@ mod packets;
 mod stream_socket;
 
 use alvr_common::prelude::*;
+use alvr_events::EventType;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr};

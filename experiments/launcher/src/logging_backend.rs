@@ -1,11 +1,7 @@
-use crate::{FILESYSTEM_LAYOUT, SERVER_DATA_MANAGER};
-use alvr_common::log::{self, LevelFilter};
-use alvr_events::{EventSeverity, EventType, LogEvent};
 use fern::Dispatch;
-use std::fs;
-use tokio::sync::broadcast::Sender;
+use iced::futures::channel::mpsc::UnboundedSender;
 
-pub fn init_logging(log_sender: Sender<String>, events_sender: Sender<String>) {
+pub fn init_logging(events_sender: UnboundedSender<String>) {
     let mut log_dispatch = Dispatch::new().format(move |out, message, record| {
         let maybe_event = format!("{message}");
         if maybe_event.contains("#{") {

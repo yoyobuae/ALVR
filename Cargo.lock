@@ -174,6 +174,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "alvr_events"
+version = "18.0.0-dev01"
+dependencies = [
+ "alvr_common",
+ "alvr_session",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "alvr_filesystem"
 version = "18.0.0-dev01"
 dependencies = [
@@ -198,6 +208,7 @@ name = "alvr_gui"
 version = "0.1.0"
 dependencies = [
  "alvr_common",
+ "alvr_events",
  "alvr_session",
  "alvr_sockets",
  "iced",
@@ -231,6 +242,7 @@ dependencies = [
  "alvr_audio",
  "alvr_commands",
  "alvr_common",
+ "alvr_events",
  "alvr_filesystem",
  "alvr_server_data",
  "alvr_session",
@@ -264,6 +276,7 @@ name = "alvr_server_data"
 version = "18.0.0-dev01"
 dependencies = [
  "alvr_common",
+ "alvr_events",
  "alvr_session",
  "alvr_sockets",
  "cpal",
@@ -290,6 +303,7 @@ name = "alvr_sockets"
 version = "18.0.0-dev01"
 dependencies = [
  "alvr_common",
+ "alvr_events",
  "alvr_session",
  "bincode",
  "bytes",
@@ -2826,11 +2840,14 @@ version = "18.0.0-dev01"
 dependencies = [
  "alvr_commands",
  "alvr_common",
+ "alvr_events",
  "alvr_filesystem",
  "alvr_gui",
  "alvr_server_data",
  "alvr_session",
  "alvr_sockets",
+ "chrono",
+ "fern",
  "iced",
  "iced_native",
  "pollster",

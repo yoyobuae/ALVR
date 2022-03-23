@@ -1,10 +1,10 @@
 use super::theme::{ContainerStyle, ACCENT, ELEMENT_BACKGROUND, FOREGROUND};
 use crate::{
-    tabs::{ConnectionEvent, ConnectionPanel, SettingsEvent, SettingsPanel},
+    tabs::{ConnectionEvent, ConnectionPanel, LogsPanel, SettingsEvent, SettingsPanel},
     theme::ContainerSecondaryStyle,
     DashboardDataInterfce,
 };
-use alvr_session::ServerEvent;
+use alvr_events::{Event, EventType};
 use iced::{
     alignment::Horizontal, button, Alignment, Button, Column, Container, Element, Length, Row,
     Space, Text,
@@ -36,7 +36,7 @@ impl button::StyleSheet for TabLabelStyle {
 
 #[derive(Clone, Debug)]
 pub enum DashboardEvent {
-    ServerEvent(ServerEvent),
+    ServerEvent(Event),
     TabClick(usize),
     LanguageClick,
     ConnectionEvent(ConnectionEvent),
@@ -65,6 +65,7 @@ pub struct Dashboard {
     language_state: TabState,
     connection_panel: ConnectionPanel,
     settings_panel: SettingsPanel,
+    logs_panel: LogsPanel,
 }
 
 impl Dashboard {
@@ -103,34 +104,39 @@ impl Dashboard {
             },
             connection_panel: ConnectionPanel::new(),
             settings_panel: SettingsPanel::new(),
+            logs_panel: LogsPanel::new(),
         }
     }
 
     pub fn update(&mut self, event: DashboardEvent, data_interface: &mut DashboardDataInterfce) {
         match event {
-            DashboardEvent::ServerEvent(event) => match event {
-                ServerEvent::Session(session) => {
-                    self.connection_panel.update(
-                        ConnectionEvent::SessionUpdated(session.clone()),
-                        data_interface,
-                    );
-                    self.settings_panel
-                        .update(SettingsEvent::SessionUpdated(session), data_interface);
-                }
-                ServerEvent::SessionUpdated => (), // deprecated
-                ServerEvent::SessionSettingsExtrapolationFailed => todo!(),
-                ServerEvent::ClientFoundOk => todo!(),
-                ServerEvent::ClientFoundInvalid => todo!(),
-                ServerEvent::ClientFoundWrongVersion(_) => todo!(),
-                ServerEvent::ClientConnected => todo!(),
-                ServerEvent::ClientDisconnected => todo!(),
-                ServerEvent::UpdateDownloadedBytesCount(_) => todo!(),
-                ServerEvent::UpdateDownloadError => todo!(),
-                ServerEvent::Statistics(_) => todo!(),
-                ServerEvent::ServerQuitting => unreachable!(),
-                ServerEvent::Raw(_) => (),
-                ServerEvent::EchoQuery(_) => todo!(),
-            },
+            DashboardEvent::ServerEvent(event) => {
+                match &event.event_type {
+                    EventType::Session(session) => {
+                        self.connection_panel.update(
+                            ConnectionEvent::SessionUpdated(session.clone()),
+                            data_interface,
+                        );
+                        self.settings_panel.update(
+                            SettingsEvent::SessionUpdated(session.clone()),
+                            data_interface,
+                        );
+                    }
+                    EventType::SessionUpdated => (), // deprecated
+                    EventType::ClientFoundOk => todo!(),
+                    EventType::ClientFoundInvalid => todo!(),
+                    EventType::ClientFoundWrongVersion(_) => todo!(),
+                    EventType::ClientConnected => todo!(),
+                    EventType::ClientDisconnected => todo!(),
+                    EventType::UpdateDownloadedBytesCount(_) => todo!(),
+                    EventType::UpdateDownloadError => todo!(),
+                    EventType::Statistics(_) => todo!(),
+                    EventType::ServerQuitting => unreachable!(),
+                    EventType::Log(_) => (),
+                };
+
+                // self.logs_panel
+            }
             DashboardEvent::TabClick(tab) => self.selected_tab = tab,
             DashboardEvent::LanguageClick => (),
             DashboardEvent::ConnectionEvent(event) => {
@@ -220,5 +226,11 @@ impl Dashboard {
         )
         .style(ContainerStyle)
         .into()
+    }
+}
+
+impl Default for Dashboard {
+    fn default() -> Self {
+        Self::new()
     }
 }

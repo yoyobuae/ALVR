@@ -1,8 +1,11 @@
+mod logging_backend;
+
 use alvr_common::{lazy_static, parking_lot::Mutex, prelude::*};
+use alvr_events::{Event, EventSeverity, EventType, LogEvent};
 use alvr_filesystem as afs;
 use alvr_gui::{Dashboard, DashboardDataInterfce, DashboardEvent};
 use alvr_server_data::ServerDataManager;
-use alvr_session::{ClientConnectionDesc, EventSeverity, Raw, ServerEvent, SessionDesc};
+use alvr_session::{ClientConnectionDesc, SessionDesc};
 use alvr_sockets::AudioDevicesList;
 use iced::{
     executor,
@@ -28,17 +31,17 @@ use std::{
 };
 
 struct EventsRecipe {
-    receiver: Arc<AMutex<UnboundedReceiver<ServerEvent>>>,
+    receiver: Arc<AMutex<UnboundedReceiver<Event>>>,
 }
 
 impl<H: Hasher, E> Recipe<H, E> for EventsRecipe {
-    type Output = ServerEvent;
+    type Output = Event;
 
     fn hash(&self, state: &mut H) {
         TypeId::of::<Self>().hash(state);
     }
 
-    fn stream(self: Box<Self>, _: BoxStream<E>) -> BoxStream<ServerEvent> {
+    fn stream(self: Box<Self>, _: BoxStream<E>) -> BoxStream<Event> {
         let receiver = Arc::clone(&self.receiver);
         Box::pin(stream::unfold((), move |_| {
             let receiver = Arc::clone(&receiver);
@@ -51,7 +54,7 @@ struct DashboardWindow {
     dashboard: Dashboard,
     data_manager: Arc<Mutex<ServerDataManager>>,
     dashboard_data_interface: DashboardDataInterfce,
-    event_receiver: Arc<AMutex<UnboundedReceiver<ServerEvent>>>,
+    event_receiver: Arc<AMutex<UnboundedReceiver<Event>>>,
     should_exit: bool,
 }
 
@@ -61,8 +64,43 @@ impl Application for DashboardWindow {
     type Flags = ();
 
     fn new(_: ()) -> (Self, Command<DashboardEvent>) {
-        let fs_layout = afs::filesystem_layout_from_launcher_exe(&env::current_exe().unwrap());
 
+        let (event_sender, event_receiver) = mpsc::unbounded();
+        let event_sender = Arc::new(Mutex::new(event_sender));
+        let event_receiver = Arc::new(AMutex::new(event_receiver));
+
+        
+
+        // debug. todo: remove
+        pollster::block_on(event_sender.lock().send(Event {
+            timestamp: "time1".into(),
+            event_type: EventType::Log(LogEvent {
+                timestamp: "time1".into(),
+                severity: EventSeverity::Info,
+                content: "test1".into(),
+            }),
+        }))
+        .ok();
+        pollster::block_on(event_sender.lock().send(EventType::Log(LogEvent {
+            timestamp: "time2".into(),
+            severity: EventSeverity::Warning,
+            content: "test2".into(),
+        })))
+        .ok();
+        pollster::block_on(event_sender.lock().send(EventType::Log(LogEvent {
+            timestamp: "time3".into(),
+            severity: EventSeverity::Error,
+            content: "test3".into(),
+        })))
+        .ok();
+        pollster::block_on(event_sender.lock().send(EventType::Log(LogEvent {
+            timestamp: "time4".into(),
+            severity: EventSeverity::Debug,
+            content: "test4".into(),
+        })))
+        .ok();
+
+        let fs_layout = afs::filesystem_layout_from_launcher_exe(&env::current_exe().unwrap());
         let data_manager = Arc::new(Mutex::new(ServerDataManager::new(&fs_layout.session())));
 
         // debug. todo: remove
@@ -91,36 +129,6 @@ impl Application for DashboardWindow {
             },
         );
 
-        let (event_sender, event_receiver) = mpsc::unbounded();
-        let event_sender = Arc::new(Mutex::new(event_sender));
-        let event_receiver = Arc::new(AMutex::new(event_receiver));
-
-        // debug. todo: remove
-        pollster::block_on(event_sender.lock().send(ServerEvent::Raw(Raw {
-            timestamp: "time1".into(),
-            severity: EventSeverity::Info,
-            content: "test1".into(),
-        })))
-        .ok();
-        pollster::block_on(event_sender.lock().send(ServerEvent::Raw(Raw {
-            timestamp: "time2".into(),
-            severity: EventSeverity::Warning,
-            content: "test2".into(),
-        })))
-        .ok();
-        pollster::block_on(event_sender.lock().send(ServerEvent::Raw(Raw {
-            timestamp: "time3".into(),
-            severity: EventSeverity::Error,
-            content: "test3".into(),
-        })))
-        .ok();
-        pollster::block_on(event_sender.lock().send(ServerEvent::Raw(Raw {
-            timestamp: "time4".into(),
-            severity: EventSeverity::Debug,
-            content: "test4".into(),
-        })))
-        .ok();
-
         let mut dashboard_data_interface = DashboardDataInterfce {
             set_session_cb: {
                 let data_manager = Arc::clone(&data_manager);
@@ -129,9 +137,11 @@ impl Application for DashboardWindow {
                     let mut data_manager = data_manager.lock();
                     data_manager.set_single_value(path, value).unwrap();
 
-                    pollster::block_on(event_sender.lock().send(ServerEvent::Session(Box::new(
-                        data_manager.session().clone(),
-                    ))))
+                    pollster::block_on(
+                        event_sender
+                            .lock()
+                            .send(EventType::Session(Box::new(data_manager.session().clone()))),
+                    )
                     .ok();
                 })
             },
@@ -174,9 +184,13 @@ impl Application for DashboardWindow {
                     let mut data_manager = data_manager.lock();
                     data_manager.update_client_list(hostname, action, None);
 
-                    pollster::block_on(event_sender.lock().send(ServerEvent::Session(Box::new(
-                        data_manager.session().clone(),
-                    ))))
+                    pollster::block_on(
+                        event_sender
+                            .lock()
+                            .send(Event {
+                                EventType::Session(Box::new(data_manager.session().clone()))
+                            }),
+                    )
                     .ok();
                 })
             },
@@ -184,7 +198,7 @@ impl Application for DashboardWindow {
 
         let mut dashboard = Dashboard::new();
         dashboard.update(
-            DashboardEvent::ServerEvent(ServerEvent::Session(Box::new(
+            DashboardEvent::ServerEvent(EventType::Session(Box::new(
                 data_manager.lock().session().clone(),
             ))),
             &mut dashboard_data_interface,
@@ -207,7 +221,13 @@ impl Application for DashboardWindow {
     }
 
     fn update(&mut self, event: DashboardEvent) -> Command<DashboardEvent> {
-        if let DashboardEvent::ServerEvent(ServerEvent::ServerQuitting) = event {
+        if matches!(
+            event,
+            DashboardEvent::ServerEvent(Event {
+                event_type: EventType::ServerQuitting,
+                ..
+            })
+        ) {
             self.should_exit = true;
         }
 
