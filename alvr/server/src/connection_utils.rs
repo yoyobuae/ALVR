@@ -1,82 +1,71 @@
-use alvr_common::{prelude::*, ALVR_NAME};
+use alvr_common::{prelude::*, ALVR_NAME, ALVR_VERSION};
 use alvr_events::EventType;
-use alvr_sockets::{
-    ClientHandshakePacket, HandshakePacket, ServerHandshakePacket, CONTROL_PORT, LOCAL_IP,
-    MAX_HANDSHAKE_PACKET_SIZE_BYTES,
+use alvr_sockets::{ServerHandshakePacket, CONTROL_PORT, HANDSHAKE_PACKET_SIZE_BYTES, LOCAL_IP};
+use std::{
+    future::Future,
+    io::{self, ErrorKind},
+    net::{IpAddr, UdpSocket},
 };
-use std::{future::Future, net::IpAddr};
-use tokio::net::UdpSocket;
 
-// client_found_cb: returns true if client is trusted, false otherwise
-pub async fn search_client_loop<F: Future<Output = bool>>(
-    client_found_cb: impl Fn(ClientHandshakePacket) -> F,
-) -> StrResult<(IpAddr, ClientHandshakePacket)> {
-    // use naked UdpSocket + [u8] packet buffer to have more control over datagram data
-    let handshake_socket = UdpSocket::bind((LOCAL_IP, CONTROL_PORT))
-        .await
-        .map_err(err!())?;
+pub struct HandshakeSocket {
+    socket: UdpSocket,
+    buffer: [u8; HANDSHAKE_PACKET_SIZE_BYTES],
+    expected_name: [u8; 16],
+}
 
-    let mut packet_buffer = [0u8; MAX_HANDSHAKE_PACKET_SIZE_BYTES];
+impl HandshakeSocket {
+    pub fn new() -> StrResult<Self> {
+        let socket = UdpSocket::bind((LOCAL_IP, CONTROL_PORT)).map_err(err!())?;
+        socket.set_nonblocking(true).map_err(err!())?;
 
-    loop {
-        let (handshake_packet_size, client_address) =
-            match handshake_socket.recv_from(&mut packet_buffer).await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    break fmt_e!("Error receiving handshake packet: {e}");
+        let mut expected_name = [0; 16];
+        expected_name.copy_from_slice(ALVR_NAME.as_bytes());
+
+        Ok(Self {
+            socket,
+            buffer: [0; HANDSHAKE_PACKET_SIZE_BYTES],
+            expected_name,
+        })
+    }
+
+    pub fn recv_non_blocking(&self) -> StrResult<Option<IpAddr>> {
+        let (size, address) = match self.socket.recv_from(&mut self.buffer) {
+            Ok(pair) => pair,
+            Err(e) => {
+                if e.kind() == ErrorKind::WouldBlock {
+                    return Ok(None);
+                } else {
+                    return fmt_e!("{e}");
                 }
-            };
-
-        let handshake_packet = if let Ok(HandshakePacket::Client(packet)) =
-            bincode::deserialize(&packet_buffer[..handshake_packet_size])
-        {
-            packet
-        } else if &packet_buffer[..5] == b"\x01ALVR" {
-            alvr_events::send_event(EventType::ClientFoundWrongVersion("v11 or previous".into()));
-            return fmt_e!("ALVR client version is too old!");
-        } else if &packet_buffer[..4] == b"ALVR" {
-            alvr_events::send_event(EventType::ClientFoundWrongVersion(
-                "v12.x.x - v13.x.x".into(),
-            ));
-            return fmt_e!("ALVR client version is too old!");
-        } else {
-            debug!("Found unrelated packet during client discovery");
-            continue;
+            }
         };
 
-        if handshake_packet.alvr_name != ALVR_NAME {
-            alvr_events::send_event(EventType::ClientFoundInvalid);
-            return fmt_e!("Error while identifying client");
-        }
+        if size == HANDSHAKE_PACKET_SIZE_BYTES && self.buffer[..16] == name {
+            let mut protocol_id_bytes = [0; 8];
+            protocol_id_bytes.copy_from_slice(&self.buffer[16..24]);
+            let received_protocol_id = u64::from_le_bytes(protocol_id_bytes);
 
-        if !alvr_common::is_version_compatible(&handshake_packet.version) {
-            let response_bytes = bincode::serialize(&HandshakePacket::Server(
-                ServerHandshakePacket::IncompatibleVersions,
-            ))
-            .map_err(err!())?;
-            handshake_socket
-                .send_to(&response_bytes, client_address)
-                .await
-                .ok();
-
-            alvr_events::send_event(EventType::ClientFoundWrongVersion(
-                handshake_packet.version.to_string(),
-            ));
-            return fmt_e!("Found ALVR client with incompatible version");
-        }
-
-        if !client_found_cb(handshake_packet.clone()).await {
-            let response_bytes = bincode::serialize(&HandshakePacket::Server(
-                ServerHandshakePacket::ClientUntrusted,
-            ))
-            .map_err(err!())?;
-
-            handshake_socket
-                .send_to(&response_bytes, client_address)
-                .await
-                .ok();
+            if received_protocol_id == alvr_common::protocol_id() {
+                Ok(Some(address))
+            } else {
+                alvr_events::send_event(EventType::ClientFoundWrongVersion(format!(
+                    "Expected protocol ID {}, Found {received_protocol_id}",
+                    alvr_common::protocol_id()
+                )));
+                Ok(None)
+            }
+        } else if self.buffer[0..4] == 0_u32.to_le_bytes()
+            && self.buffer[4..12] == 4_u64.to_le_bytes()
+            && self.buffer[12..16] == b"ALVR"
+        {
+            alvr_events::send_event(EventType::ClientFoundWrongVersion("v14 to v18".into()));
+        } else if self.buffer[..5] = b"\x01ALVR" {
+            // People might still download the client from the polygraphene reposiory
+            alvr_events::send_event(EventType::ClientFoundWrongVersion("v11 or previous".into()));
         } else {
-            break Ok((client_address.ip(), handshake_packet));
+            // Unexpected packet.
+            // Note: no need to check for v12 and v13, not found in the wild anymore
+            Ok(None)
         }
     }
 }

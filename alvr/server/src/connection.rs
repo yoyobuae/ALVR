@@ -1,7 +1,8 @@
 use crate::{
-    connection_utils, EyeFov, TimeSync, TrackingInfo, TrackingInfo_Controller,
-    TrackingInfo_Controller__bindgen_ty_1, TrackingQuat, TrackingVector3, CLIENTS_UPDATED_NOTIFIER,
-    HAPTICS_SENDER, RESTART_NOTIFIER, SERVER_DATA_MANAGER, TIME_SYNC_SENDER, VIDEO_SENDER,
+    connection_utils::{self, HandshakeSocket},
+    EyeFov, TimeSync, TrackingInfo, TrackingInfo_Controller, TrackingInfo_Controller__bindgen_ty_1,
+    TrackingQuat, TrackingVector3, CLIENTS_UPDATED_NOTIFIER, HAPTICS_SENDER, RESTART_NOTIFIER,
+    RUNNING, SERVER_DATA_MANAGER, TIME_SYNC_SENDER, VIDEO_SENDER,
 };
 use alvr_audio::{AudioDevice, AudioDeviceType};
 use alvr_common::{
@@ -24,7 +25,7 @@ use std::{
     net::IpAddr,
     process::Command,
     str::FromStr,
-    sync::{mpsc as smpsc, Arc},
+    sync::{atomic::Ordering, mpsc as smpsc, Arc},
     thread,
     time::Duration,
 };
@@ -1073,4 +1074,24 @@ pub async fn connection_lifecycle_loop() {
             time::sleep(RETRY_CONNECT_MIN_INTERVAL),
         );
     }
+}
+
+// if started, this thread never stops until shutdown
+pub fn client_discover_thread() -> StrResult {
+    let socket = HandshakeSocket::new()?;
+
+    while RUNNING.load(Ordering::Relaxed) {
+        match socket.recv_non_blocking() {
+            Ok(Some(address)) => {
+                // add control socket
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(500)),
+            Err(e) => {
+                error!("{e}");
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+
+    Ok(())
 }

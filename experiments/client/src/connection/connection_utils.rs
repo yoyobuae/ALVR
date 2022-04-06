@@ -1,7 +1,7 @@
 use alvr_common::prelude::*;
 use alvr_sockets::{
-    ClientHandshakePacket, HandshakePacket, ServerHandshakePacket, CONTROL_PORT, LOCAL_IP,
-    MAX_HANDSHAKE_PACKET_SIZE_BYTES,
+    ClientHandshakePacket, HandshakePacket, ServerHandshakePacket, CONTROL_PORT,
+    HANDSHAKE_PACKET_SIZE_BYTES, LOCAL_IP,
 };
 use std::{net::Ipv4Addr, time::Duration};
 use tokio::{net::UdpSocket, time};
@@ -38,7 +38,7 @@ pub async fn announce_client_loop(
         let receive_response_loop = {
             let handshake_socket = &mut handshake_socket;
             async move {
-                let mut server_response_buffer = [0; MAX_HANDSHAKE_PACKET_SIZE_BYTES];
+                let mut server_response_buffer = [0; HANDSHAKE_PACKET_SIZE_BYTES];
                 loop {
                     // this call will receive also the broadcasted client packet that must be ignored
                     let (packet_size, _) = handshake_socket

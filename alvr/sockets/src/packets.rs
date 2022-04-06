@@ -1,41 +1,32 @@
-use std::{collections::HashMap, net::IpAddr, time::Duration};
-
 use alvr_common::{
-    glam::{Quat, Vec2, Vec3},
+    glam::{Quat, UVec2, Vec2, Vec3},
     semver::Version,
 };
 use alvr_session::Fov;
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, net::IpAddr, time::Duration};
 
-pub const INPUT: u16 = 0; // tracking and buttons
-pub const HAPTICS: u16 = 1;
-pub const AUDIO: u16 = 2;
-pub const VIDEO: u16 = 3;
+pub const EVENT: u16 = 0; // struct `Event` that server and client can freely send.
+pub const REQUEST: u16 = 1; // packets that go from client to server to client, blocking on client
+pub const INPUT: u16 = 2; // tracking and buttons
+pub const HAPTICS: u16 = 3;
+pub const AUDIO: u16 = 4;
+pub const VIDEO: u16 = 5;
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct ClientHandshakePacket {
-    pub alvr_name: String,
-    pub version: Version,
-    pub device_name: String,
-    pub hostname: String,
-
-    // reserved field is used to add features between major releases: the schema of the packet
-    // should never change anymore (required only for this packet).
-    pub reserved1: String,
-    pub reserved2: String,
-}
+// (Client) handshake packet:
+// This is defined as raw bytes, not mangled with any Rust networking or binary encoder
+// [ identity prefix, protocol ID ] total 24 bytes
+// identity prefix = b"ALVR", total exactly 16 bytes with trailing nulls
+// protocol ID = derived from the version, 8 bytes
+// the protocol ID can be created by hashing substrings of the version. Currently it includes the
+// major version and prerelease data. (minor, patch and medatata (+) do not influence protocol
+// compatibility)
 
 // Since this packet is not essential, any change to it will not be a braking change
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ServerHandshakePacket {
     ClientUntrusted,
-    IncompatibleVersions,
-}
-
-#[derive(Serialize, Deserialize)]
-pub enum HandshakePacket {
-    Client(ClientHandshakePacket),
-    Server(ServerHandshakePacket),
+    IncompatibleVersions { server_version: Version },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -50,10 +41,32 @@ pub struct HeadsetInfoPacket {
     pub reserved: String,
 }
 
+// Ask server to configure video and audio components with this client limits. Configure this client
+// as the peer to exchange video and audio streams. Note: for now every client is allowed to send
+// tracking data, spoofing any kind of device.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct StreamCapabilitiesRequest {
+    pub recommended_view_size: UVec2,
+    pub max_view_size: UVec2,
+    pub available_refresh_rates: Vec<f32>, // todo: phase out
+    pub preferred_refresh_rate: f32,       // todo: phase out
+}
+
+// Response of the server to StreamRequest. should be wrapped by Option
+pub enum StreamConfigResponse {
+    Success {
+        view_size: UVec2,
+        fps: f32, // todo: phase out
+        game_audio_sample_rate: u32,
+    },
+}
+
+pub struct ClientConnectionResponse {
+    // ClientUntrusted
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ClientConfigPacket {
-    pub session_desc: String, // transfer session as string to allow for extrapolation
-    pub dashboard_url: String,
     pub eye_resolution_width: u32,
     pub eye_resolution_height: u32,
     pub fps: f32,
@@ -99,6 +112,38 @@ pub enum ClientControlPacket {
     Reserved(String),
     ReservedBuffer(Vec<u8>),
 }
+
+#[derive(Serialize, Deserialize)]
+pub struct AudioDevicesList {
+    pub output: Vec<String>,
+    pub input: Vec<String>,
+}
+
+pub enum GpuVendor {
+    Nvidia,
+    Amd,
+    Other,
+}
+
+#[derive(Clone, Debug)]
+pub enum PathSegment {
+    Name(String),
+    Index(usize),
+}
+
+pub enum ClientListAction {
+    AddIfMissing { display_name: String },
+    TrustAndMaybeAddIp(Option<IpAddr>),
+    RemoveIpOrEntry(Option<IpAddr>),
+}
+
+pub enum ClientRequestPacket {
+    Session,
+}
+
+pub enum ServerResponsePacket {}
+
+// pub enum ServerSideEvent
 
 // legacy video packet
 #[derive(Serialize, Deserialize, Clone)]
@@ -187,28 +232,4 @@ pub struct Haptics {
     pub duration: Duration,
     pub frequency: f32,
     pub amplitude: f32,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct AudioDevicesList {
-    pub output: Vec<String>,
-    pub input: Vec<String>,
-}
-
-pub enum GpuVendor {
-    Nvidia,
-    Amd,
-    Other,
-}
-
-#[derive(Clone, Debug)]
-pub enum PathSegment {
-    Name(String),
-    Index(usize),
-}
-
-pub enum ClientListAction {
-    AddIfMissing { display_name: String },
-    TrustAndMaybeAddIp(Option<IpAddr>),
-    RemoveIpOrEntry(Option<IpAddr>),
 }

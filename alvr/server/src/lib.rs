@@ -32,7 +32,7 @@ use std::{
     os::raw::c_char,
     ptr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Once,
     },
     thread,
@@ -61,6 +61,7 @@ static TIME_SYNC_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<TimeSyncPacket>
 static CLIENTS_UPDATED_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
 static RESTART_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
 static SHUTDOWN_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
+static RUNNING: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(true));
 
 static FRAME_RENDER_VS_CSO: Lazy<Vec<u8>> =
     Lazy::new(|| include_bytes!("../cpp/platform/win32/FrameRenderVS.cso").to_vec());

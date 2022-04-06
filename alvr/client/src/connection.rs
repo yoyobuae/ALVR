@@ -1,17 +1,16 @@
 #![allow(clippy::if_same_then_else)]
 
 use crate::{
-    connection_utils::{self, ConnectionError},
+    connection_utils::{self},
     TimeSync, VideoFrame, BATTERY_SENDER, INPUT_SENDER, TIME_SYNC_SENDER,
     VIDEO_ERROR_REPORT_SENDER, VIEWS_CONFIG_SENDER,
 };
 use alvr_common::{glam::Vec2, prelude::*, ALVR_NAME, ALVR_VERSION};
 use alvr_session::{CodecType, SessionDesc};
 use alvr_sockets::{
-    spawn_cancelable, ClientConfigPacket, ClientControlPacket, ClientHandshakePacket, Haptics,
-    HeadsetInfoPacket, PeerType, PrivateIdentity, ProtoControlSocket, ServerControlPacket,
-    ServerHandshakePacket, StreamSocketBuilder, VideoFrameHeaderPacket, AUDIO, HAPTICS, INPUT,
-    VIDEO,
+    spawn_cancelable, ClientConfigPacket, ClientControlPacket, Haptics, HeadsetInfoPacket,
+    PeerType, PrivateIdentity, ProtoControlSocket, ServerControlPacket, ServerHandshakePacket,
+    StreamSocketBuilder, VideoFrameHeaderPacket, AUDIO, HAPTICS, INPUT, VIDEO,
 };
 use futures::future::BoxFuture;
 use jni::{
@@ -802,3 +801,5 @@ pub async fn connection_lifecycle_loop(
         );
     }
 }
+
+pub fn connection_thread() {}

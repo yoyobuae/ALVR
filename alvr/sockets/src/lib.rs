@@ -1,4 +1,5 @@
 mod control_socket;
+mod ldc_tcp_socket;
 mod packets;
 mod stream_socket;
 
@@ -13,7 +14,7 @@ pub use stream_socket::*;
 
 pub const LOCAL_IP: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 pub const CONTROL_PORT: u16 = 9943;
-pub const MAX_HANDSHAKE_PACKET_SIZE_BYTES: usize = 4_000;
+pub const HANDSHAKE_PACKET_SIZE_BYTES: usize = 24; // packet layout explained in packets.rs
 
 type Ldc = tokio_util::codec::LengthDelimitedCodec;
 
