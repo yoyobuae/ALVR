@@ -24,26 +24,12 @@ jobs:
 
       - uses: actions/checkout@v2
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-
       - name: Bump version
         id: bump_version
-        env:
-          RUST_BACKTRACE: 1
         run: |
           $versionarg = "${{ github.event.inputs.version }}"
           $versionarg = If ($versionarg.Length -gt 0) { "--version $versionarg" } else { "" }
-          $out = cargo xtask bump-versions $versionarg.split()
-          echo $out
-          cargo update -p alvr_common
-          echo "::set-output name=version_tag::$(echo $out | sls -CaseSensitive -Pattern '^v.*$')"
-
-      - name: Push changes
-        uses: stefanzweifel/git-auto-commit-action@v4
-        with:
-          commit_message: "[Auto] Bump version"
+          echo "::set-output name=version_tag::$versionarg"
 
       - name: Output ref for later checkouts
         id: output_ref
@@ -61,62 +47,8 @@ jobs:
           prerelease: false
           commitish: ${{ steps.output_ref.outputs.release_ref }}
 
-  build_windows_server:
-    runs-on: windows-2019
-    needs: [prepare_release]
-    env:
-      # For bindgen to find libclang.dll, we need to give it the path to the Visual Studio package.
-      # This is specific to the GitHub windows-2019 runner.
-      LIBCLANG_PATH: 'C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Tools\Llvm\x64\bin'
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-        with:
-          ref: ${{ needs.prepare_release.outputs.release_ref }}
-
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-
-      - name: Download WiX 3.14 binaries
-        run: |
-          Invoke-WebRequest http://static.wixtoolset.org/releases/v3.14.0.4118/wix314-binaries.zip -OutFile wix314-binaries.zip
-          Expand-Archive -Path wix314-binaries.zip -DestinationPath wix314-binaries/bin
-
-      - name: Build and package ALVR (.zip, .exe)
-        id: build
-        env:
-          WIX: "wix314-binaries"
-          RUST_BACKTRACE: 1
-        run: |
-          cargo xtask build-windows-deps
-          cargo xtask publish-server --gpl
-          $file = Get-ChildItem -Name .\build\*.exe | Select-Object -f 1
-          echo "::set-output name=exe_filename::$file"
-
-      # Assets upload: .exe, .zip
-      - name: Upload Windows installer
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.prepare_release.outputs.upload_url }}
-          asset_path: ./build/${{ steps.build.outputs.exe_filename }}
-          asset_name: ${{ steps.build.outputs.exe_filename }}
-          asset_content_type: application/octet-stream
-      - name: Upload portable server for Windows
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.prepare_release.outputs.upload_url }}
-          asset_path: ./build/alvr_server_windows.zip
-          asset_name: alvr_server_windows.zip
-          asset_content_type: application/zip
-
   build_linux_server_portable:
-    runs-on: ubuntu-21-10-server
+    runs-on: self-hosted
     needs: [prepare_release]
     steps:
       - name: Checkout code
@@ -133,7 +65,7 @@ jobs:
           RUST_BACKTRACE: 1
         run: |
           sudo apt update
-          sudo apt install build-essential pkg-config nasm libva-dev libdrm-dev libvulkan-dev libx264-dev libx265-dev cmake libasound2-dev libjack-jackd2-dev libgtk-3-dev libunwind-dev libffmpeg-nvenc-dev nvidia-cuda-toolkit
+          sudo apt -y install build-essential pkg-config nasm libva-dev libdrm-dev libvulkan-dev libx264-dev libx265-dev cmake libasound2-dev libjack-jackd2-dev libgtk-3-dev libunwind-dev libffmpeg-nvenc-dev nvidia-cuda-toolkit
           cp packaging/deb/cuda.pc /usr/share/pkgconfig
           cargo xtask build-ffmpeg-linux
           cd deps/linux/FFmpeg-n4.4 && sudo make install && cd ../../..
@@ -155,125 +87,3 @@ jobs:
           asset_name: alvr_server_linux_portable.zip
           asset_content_type: application/zip
 
-  build_linux_server:
-    runs-on: ubuntu-21-10-server
-    needs: [prepare_release]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-        with:
-          ref: ${{ needs.prepare_release.outputs.release_ref }}
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-
-      - name: Build and install dependencies
-        env:
-          RUST_BACKTRACE: 1
-        run: |
-          sudo apt update
-          sudo apt install build-essential pkg-config nasm libva-dev libdrm-dev libvulkan-dev libx264-dev libx265-dev cmake libasound2-dev libjack-jackd2-dev libgtk-3-dev libunwind-dev libffmpeg-nvenc-dev nvidia-cuda-toolkit
-          cp packaging/deb/cuda.pc /usr/share/pkgconfig
-          cargo xtask build-ffmpeg-linux
-          cd deps/linux/FFmpeg-n4.4 && sudo make install && cd ../../..
-
-      - name: Build and package ALVR (.tar.gz)
-        id: build
-        env:
-          RUST_BACKTRACE: 1
-        run: |
-          cargo xtask build-server --release
-          tar -czvf ./build/alvr_server_linux.tar.gz -C ./build/alvr_server_linux .
-
-      - name: Upload portable server for Linux
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.prepare_release.outputs.upload_url }}
-          asset_path: ./build/alvr_server_linux.tar.gz
-          asset_name: alvr_server_linux.tar.gz
-          asset_content_type: application/gzip
-
-  build_android_client:
-    # Windows latest has Rust, Android NDK and LLVM already installed.
-    # https://github.com/actions/virtual-environments/blob/main/images/win/Windows2019-Readme.md
-    runs-on: windows-2019
-    needs: [prepare_release]
-    env:
-      # For bindgen to find libclang.dll, we need to give it the path to the Visual Studio package.
-      # This is specific to the GitHub windows-2019 runner.
-      LIBCLANG_PATH: 'C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Tools\Llvm\x64\bin'
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-        with:
-          ref: ${{ needs.prepare_release.outputs.release_ref }}
-
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          target: aarch64-linux-android
-          override: true
-
-      - uses: actions/setup-java@v2
-        with:
-          distribution: 'temurin'
-          java-version: '11'
-
-      - name: Set better Android SDK path (workaround for rust-android-gradle)
-        shell: cmd
-        run: mklink /J "%GITHUB_WORKSPACE%\android-sdk" "%ANDROID_SDK_ROOT%"
-
-      - name: Build dependencies
-        env:
-          RUST_BACKTRACE: 1
-        run: cargo xtask build-android-deps
-
-      - name: Build and package ALVR (.apk)
-        id: build
-        env:
-          ANDROID_HOME: '${{ github.workspace }}\android-sdk'
-          ANDROID_SDK_ROOT: '${{ github.workspace }}\android-sdk'
-          RUST_BACKTRACE: 1
-        run: cargo xtask publish-client
-
-      - name: Sign Oculus Quest APK
-        uses: r0adkll/sign-android-release@v1
-        id: sign_quest
-        with:
-          releaseDirectory: build/alvr_client_oculus_quest
-          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
-          alias: ${{ secrets.KEY_ALIAS }}
-          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
-          keyPassword: ${{ secrets.KEY_PASSWORD }}
-      - name: Sign Oculus Go APK
-        uses: r0adkll/sign-android-release@v1
-        id: sign_go
-        with:
-          releaseDirectory: build/alvr_client_oculus_go
-          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
-          alias: ${{ secrets.KEY_ALIAS }}
-          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
-          keyPassword: ${{ secrets.KEY_PASSWORD }}
-
-      # Assets upload: 2 * .apk
-      - name: Upload client for Oculus Quest
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.prepare_release.outputs.upload_url }}
-          asset_path: ${{steps.sign_quest.outputs.signedReleaseFile}}
-          asset_name: alvr_client_oculus_quest.apk
-          asset_content_type: application/vnd.android.package-archive
-      - name: Upload client for Oculus Go
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.prepare_release.outputs.upload_url }}
-          asset_path: ${{steps.sign_go.outputs.signedReleaseFile}}
-          asset_name: alvr_client_oculus_go.apk
-          asset_content_type: application/vnd.android.package-archive
