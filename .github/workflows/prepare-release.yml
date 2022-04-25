@@ -116,7 +116,7 @@ jobs:
           asset_content_type: application/zip
 
   build_linux_server_portable:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-21-10-server
     needs: [prepare_release]
     steps:
       - name: Checkout code
@@ -157,7 +157,7 @@ jobs:
           asset_content_type: application/gzip
 
   build_linux_server:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-21-10-server
     needs: [prepare_release]
     steps:
       - name: Checkout code
