@@ -88,7 +88,7 @@ jobs:
         run: |
           cargo xtask prepare-deps --platform windows --ci
           cargo xtask package-streamer --gpl
-          $file = Get-ChildItem -Name .\build\*.exe | Select-Object -f 1
+          $file = Get-ChildItem -Name .\build\**\*.exe | Select-Object -f 1
           echo "::set-output name=exe_filename::$file"
 
       - name: Upload Windows installer (exe)
