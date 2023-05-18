@@ -31,9 +31,10 @@ use alvr_common::{
     prelude::*,
     Fov, RelaxedAtomic,
 };
-use alvr_events::ButtonValue;
+use alvr_packets::{
+    BatteryPacket, ButtonEntry, ClientControlPacket, ClientStatistics, Tracking, ViewsConfig,
+};
 use alvr_session::{CodecType, Settings};
-use alvr_sockets::{BatteryPacket, ClientControlPacket, ClientStatistics, Tracking, ViewsConfig};
 use decoder::EXTERNAL_DECODER;
 use serde::{Deserialize, Serialize};
 use statistics::StatisticsManager;
@@ -168,11 +169,9 @@ pub fn send_playspace(area: Option<Vec2>) {
     }
 }
 
-pub fn send_button(path_id: u64, value: ButtonValue) {
+pub fn send_buttons(entries: Vec<ButtonEntry>) {
     if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
-        sender
-            .send(ClientControlPacket::Button { path_id, value })
-            .ok();
+        sender.send(ClientControlPacket::Buttons(entries)).ok();
     }
 }
 

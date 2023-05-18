@@ -20,6 +20,7 @@ struct FramePacket {
   uint8_t *data;
   int size;
   uint64_t pts;
+  bool isIDR;
 };
 
 class EncodePipeline

@@ -8,7 +8,7 @@ use alvr_common::{
     settings_schema::Switch,
     DeviceMotion, Fov, Pose, RelaxedAtomic, HEAD_ID, LEFT_HAND_ID, RIGHT_HAND_ID,
 };
-use alvr_sockets::{FaceData, Tracking};
+use alvr_packets::{FaceData, Tracking};
 use interaction::{FaceInputContext, HandsInteractionContext};
 use khronos_egl::{self as egl, EGL1_4};
 use openxr as xr;
@@ -321,11 +321,16 @@ fn update_streaming_input(
         face_data,
     });
 
-    interaction::update_buttons(
+    let button_entries = interaction::update_buttons(
         ctx.platform,
         &ctx.xr_session,
         &ctx.hands_context.button_actions,
-    )
+    )?;
+    if !button_entries.is_empty() {
+        alvr_client_core::send_buttons(button_entries);
+    }
+
+    Ok(())
 }
 
 pub fn entry_point() {
@@ -900,21 +905,7 @@ pub fn entry_point() {
 
 #[allow(unused)]
 fn xr_runtime_now(xr_instance: &xr::Instance, platform: Platform) -> Option<Duration> {
-    let time_nanos = {
-        #[cfg(target_os = "android")]
-        if platform == Platform::Pico {
-            let mut ts_now = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts_now) };
-            ts_now.tv_sec * 1_000_000_000 + ts_now.tv_nsec
-        } else {
-            xr_instance.now().ok()?.as_nanos()
-        }
-        #[cfg(not(target_os = "android"))]
-        xr_instance.now().ok()?.as_nanos()
-    };
+    let time_nanos = xr_instance.now().ok()?.as_nanos();
 
     (time_nanos > 0).then(|| Duration::from_nanos(time_nanos as _))
 }

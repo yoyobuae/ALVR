@@ -184,7 +184,7 @@ void (*LogDebug)(const char *stringPtr);
 void (*LogPeriodically)(const char *tag, const char *stringPtr);
 void (*DriverReadyIdle)(bool setDefaultChaprone);
 void (*InitializeDecoder)(const unsigned char *configBuffer, int len, int codec);
-void (*VideoSend)(unsigned long long targetTimestampNs, unsigned char *buf, int len);
+void (*VideoSend)(unsigned long long targetTimestampNs, unsigned char *buf, int len, bool isIdr);
 void (*HapticsSend)(unsigned long long path, float duration_s, float frequency, float amplitude);
 void (*ShutdownRuntime)();
 unsigned long long (*PathStringToHash)(const char *path);
@@ -226,9 +226,7 @@ void DeinitializeStreaming() {
     }
 }
 
-void SendVSync() {
-    vr::VRServerDriverHost()->VsyncEvent(0.0);
-}
+void SendVSync() { vr::VRServerDriverHost()->VsyncEvent(0.0); }
 
 void RequestIDR() {
     if (g_driver_provider.hmd && g_driver_provider.hmd->m_encoder) {
@@ -241,18 +239,19 @@ void SetTracking(unsigned long long targetTimestampNs,
                  const FfiDeviceMotion *deviceMotions,
                  int motionsCount,
                  const FfiHandSkeleton *leftHand,
-                 const FfiHandSkeleton *rightHand) {
+                 const FfiHandSkeleton *rightHand,
+                 unsigned int controllersTracked) {
     for (int i = 0; i < motionsCount; i++) {
         if (deviceMotions[i].deviceID == HEAD_ID && g_driver_provider.hmd) {
             g_driver_provider.hmd->OnPoseUpdated(targetTimestampNs, deviceMotions[i]);
         } else {
             if (g_driver_provider.left_controller && deviceMotions[i].deviceID == LEFT_HAND_ID) {
                 g_driver_provider.left_controller->onPoseUpdate(
-                    controllerPoseTimeOffsetS, deviceMotions[i], leftHand);
+                    controllerPoseTimeOffsetS, deviceMotions[i], leftHand, controllersTracked);
             } else if (g_driver_provider.right_controller &&
                        deviceMotions[i].deviceID == RIGHT_HAND_ID) {
                 g_driver_provider.right_controller->onPoseUpdate(
-                    controllerPoseTimeOffsetS, deviceMotions[i], rightHand);
+                    controllerPoseTimeOffsetS, deviceMotions[i], rightHand, controllersTracked);
             }
         }
     }

@@ -434,7 +434,20 @@ void VideoEncoderVCE::Receive(AMFDataPtr data)
 		fpOut.write(p, length);
 	}
 
-	ParseFrameNals(m_codec, reinterpret_cast<uint8_t *>(p), length, targetTimestampNs);
+	uint64_t type;
+	bool isIdr;
+	if(m_codec == ALVR_CODEC_H264) 
+	{
+		data->GetProperty(AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE, &type);
+		isIdr = type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR;
+	}
+	else
+	{
+		data->GetProperty(AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE, &type);
+		isIdr = type == AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE_IDR;
+	}
+
+	ParseFrameNals(m_codec, reinterpret_cast<uint8_t *>(p), length, targetTimestampNs, isIdr);
 }
 
 void VideoEncoderVCE::ApplyFrameProperties(const amf::AMFSurfacePtr &surface, bool insertIDR) {

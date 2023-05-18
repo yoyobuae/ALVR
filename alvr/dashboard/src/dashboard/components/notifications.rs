@@ -1,13 +1,17 @@
 use crate::theme::{self, log_colors};
-use alvr_common::LogSeverity;
-use alvr_events::LogEvent;
+use alvr_common::{LogEntry, LogSeverity};
 use alvr_session::Settings;
 use eframe::{
     egui::{self, Frame, Label, Layout, RichText, TopBottomPanel},
     emath::Align,
     epaint::{Color32, Stroke},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[cfg(target_arch = "wasm32")]
+use instant::Instant;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 
 const NO_NOTIFICATIONS: &str = "No new notifications";
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,7 +39,7 @@ impl NotificationBar {
         self.min_notification_level = settings.logging.notification_level;
     }
 
-    pub fn push_notification(&mut self, event: LogEvent) {
+    pub fn push_notification(&mut self, event: LogEntry) {
         let now = Instant::now();
         if event.severity >= self.min_notification_level
             && (now > self.receive_instant + TIMEOUT || event.severity >= self.current_level)

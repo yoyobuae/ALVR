@@ -1,7 +1,7 @@
 use crate::{ClientCoreEvent, EVENT_QUEUE};
 use alvr_common::{once_cell::sync::Lazy, parking_lot::Mutex, RelaxedAtomic};
+use alvr_packets::DecoderInitializationConfig;
 use alvr_session::{CodecType, MediacodecDataType};
-use alvr_sockets::DecoderInitializationConfig;
 use std::time::Duration;
 
 #[cfg(target_os = "android")]
@@ -62,34 +62,30 @@ pub fn create_decoder(lazy_config: DecoderInitializationConfig) {
 
             if let Some(sender) = &*crate::CONTROL_CHANNEL_SENDER.lock() {
                 sender
-                    .send(alvr_sockets::ClientControlPacket::RequestIdr)
+                    .send(alvr_packets::ClientControlPacket::RequestIdr)
                     .ok();
             }
         }
     }
 }
 
-pub fn push_nal(timestamp: Duration, nal: &[u8]) {
+// return: frame has been successfully enqueued
+pub fn push_nal(timestamp: Duration, nal: &[u8]) -> bool {
     if EXTERNAL_DECODER.value() {
         EVENT_QUEUE.lock().push_back(ClientCoreEvent::FrameReady {
             timestamp,
             nal: nal.to_vec(),
         });
+        true
     } else {
         #[cfg(target_os = "android")]
         if let Some(decoder) = &*DECODER_ENQUEUER.lock() {
-            if !matches!(show_err(decoder.push_frame_nal(timestamp, nal)), Some(true)) {
-                if let Some(sender) = &*crate::CONTROL_CHANNEL_SENDER.lock() {
-                    sender
-                        .send(alvr_sockets::ClientControlPacket::RequestIdr)
-                        .ok();
-                }
-            }
-        } else if let Some(sender) = &*crate::CONTROL_CHANNEL_SENDER.lock() {
-            sender
-                .send(alvr_sockets::ClientControlPacket::RequestIdr)
-                .ok();
+            matches!(show_err(decoder.push_frame_nal(timestamp, nal)), Some(true))
+        } else {
+            false
         }
+        #[cfg(not(target_os = "android"))]
+        false
     }
 }
 

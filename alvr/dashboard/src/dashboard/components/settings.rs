@@ -3,9 +3,9 @@ use super::{
     presets::{builtin_schema, PresetControl},
     NestingInfo, SettingControl,
 };
-use crate::dashboard::{get_id, DashboardRequest};
+use crate::dashboard::{get_id, ServerRequest};
+use alvr_packets::AudioDevicesList;
 use alvr_session::{SessionSettings, Settings};
-use alvr_sockets::AudioDevicesList;
 use eframe::egui::{Grid, ScrollArea, Ui};
 use serde_json as json;
 
@@ -76,7 +76,7 @@ impl SettingsTab {
             .update_session_settings(&self.session_settings_json);
     }
 
-    pub fn ui(&mut self, ui: &mut Ui) -> Option<DashboardRequest> {
+    pub fn ui(&mut self, ui: &mut Ui) -> Option<ServerRequest> {
         let mut requests = vec![];
 
         ui.heading("Presets");
@@ -132,7 +132,7 @@ impl SettingsTab {
             });
 
         if !requests.is_empty() {
-            Some(DashboardRequest::SetValues(requests))
+            Some(ServerRequest::SetValues(requests))
         } else {
             None
         }

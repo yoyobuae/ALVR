@@ -1,13 +1,13 @@
 use alvr_common::{
     glam::{UVec2, Vec2},
-    DeviceMotion, Fov, LogSeverity, Pose,
+    DeviceMotion, Fov, LogEntry, LogSeverity, Pose,
 };
-use alvr_events::{ButtonValue, LogEvent};
 use alvr_session::{CodecType, SessionDesc};
 use serde::{Deserialize, Serialize};
 use std::{
     fmt::{self, Debug},
     net::IpAddr,
+    path::PathBuf,
     time::Duration,
 };
 
@@ -73,6 +73,18 @@ pub struct BatteryPacket {
     pub is_plugged: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub enum ButtonValue {
+    Binary(bool),
+    Scalar(f32),
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ButtonEntry {
+    pub path_id: u64,
+    pub value: ButtonValue,
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum ClientControlPacket {
     PlayspaceSync(Option<Vec2>),
@@ -82,7 +94,7 @@ pub enum ClientControlPacket {
     ViewsConfig(ViewsConfig),
     Battery(BatteryPacket),
     VideoErrorReport, // legacy
-    Button { path_id: u64, value: ButtonValue },
+    Buttons(Vec<ButtonEntry>),
     ActiveInteractionProfile { device_id: u64, profile_id: u64 },
     Log { level: LogSeverity, message: String },
     Reserved(String),
@@ -95,6 +107,12 @@ pub struct FaceData {
     pub fb_face_expression: Option<Vec<f32>>, // issue: Serialize does not support [f32; 63]
     pub htc_eye_expression: Option<Vec<f32>>,
     pub htc_lip_expression: Option<Vec<f32>>, // issue: Serialize does not support [f32; 37]
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct VideoPacketHeader {
+    pub timestamp: Duration,
+    pub is_idr: bool,
 }
 
 // Note: face_data does not respect target_timestamp.
@@ -114,7 +132,7 @@ pub struct Haptics {
     pub amplitude: f32,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AudioDevicesList {
     pub output: Vec<String>,
     pub input: Vec<String>,
@@ -195,9 +213,14 @@ pub struct PathValuePair {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum DashboardRequest {
-    Ping,
-    Log(LogEvent),
+pub enum FirewallRulesAction {
+    Add,
+    Remove,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ServerRequest {
+    Log(LogEntry),
     GetSession,
     UpdateSession(Box<SessionDesc>),
     SetValues(Vec<PathValuePair>),
@@ -210,11 +233,10 @@ pub enum DashboardRequest {
     InsertIdr,
     StartRecording,
     StopRecording,
+    FirewallRules(FirewallRulesAction),
+    RegisterAlvrDriver,
+    UnregisterDriver(PathBuf),
+    GetDriverList,
     RestartSteamvr,
     ShutdownSteamvr,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub enum ServerResponse {
-    AudioDevices(AudioDevicesList),
 }

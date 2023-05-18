@@ -1,10 +1,9 @@
 use crate::{
-    dashboard::DashboardRequest,
-    steamvr_launcher::LAUNCHER,
+    dashboard::ServerRequest,
     theme::{self, log_colors},
 };
+use alvr_packets::ClientListAction;
 use alvr_session::SessionDesc;
-use alvr_sockets::ClientListAction;
 use eframe::{
     egui::{Frame, Grid, Layout, RichText, TextEdit, Ui, Window},
     emath::{Align, Align2},
@@ -34,7 +33,7 @@ impl ConnectionsTab {
         ui: &mut Ui,
         session: &SessionDesc,
         connected_to_server: bool,
-    ) -> Option<DashboardRequest> {
+    ) -> Option<ServerRequest> {
         let mut response = None;
 
         if !connected_to_server {
@@ -51,9 +50,11 @@ impl ConnectionsTab {
                                 .color(Color32::BLACK),
                             );
                         });
+
+                        #[cfg(not(target_arch = "wasm32"))]
                         ui.with_layout(Layout::right_to_left(eframe::emath::Align::Center), |ui| {
                             if ui.button("Launch SteamVR").clicked() {
-                                LAUNCHER.lock().launch_steamvr();
+                                crate::steamvr_launcher::LAUNCHER.lock().launch_steamvr();
                             }
                         });
                     });
@@ -83,7 +84,7 @@ impl ConnectionsTab {
                             });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui.button("Trust").clicked() {
-                                    response = Some(DashboardRequest::UpdateClientList {
+                                    response = Some(ServerRequest::UpdateClientList {
                                         hostname: hostname.clone(),
                                         action: ClientListAction::Trust,
                                     });
@@ -116,7 +117,7 @@ impl ConnectionsTab {
                             });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui.button("Remove").clicked() {
-                                    response = Some(DashboardRequest::UpdateClientList {
+                                    response = Some(ServerRequest::UpdateClientList {
                                         hostname: hostname.clone(),
                                         action: ClientListAction::RemoveEntry,
                                     });
@@ -173,7 +174,7 @@ impl ConnectionsTab {
                                 state.ips.iter().filter_map(|s| s.parse().ok()).collect();
 
                             if state.new_client {
-                                response = Some(DashboardRequest::UpdateClientList {
+                                response = Some(ServerRequest::UpdateClientList {
                                     hostname: state.hostname.clone(),
                                     action: ClientListAction::AddIfMissing {
                                         trusted: true,
@@ -181,7 +182,7 @@ impl ConnectionsTab {
                                     },
                                 });
                             } else {
-                                response = Some(DashboardRequest::UpdateClientList {
+                                response = Some(ServerRequest::UpdateClientList {
                                     hostname: state.hostname.clone(),
                                     action: ClientListAction::SetManualIps(manual_ips),
                                 });

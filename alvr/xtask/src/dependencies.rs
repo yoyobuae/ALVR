@@ -251,7 +251,7 @@ fn get_android_openxr_loaders() {
     // Pico
     command::download_and_extract_zip(
         &sh,
-        "https://sdk.picovr.com/developer-platform/sdk/Pico_OpenXR_SDK_v210.zip",
+        "https://sdk.picovr.com/developer-platform/sdk/PICO_OpenXR_SDK_220.zip",
         &temp_dir,
     )
     .unwrap();
@@ -286,6 +286,15 @@ pub fn build_android_deps(skip_admin_priv: bool) {
     }
 
     cmd!(sh, "rustup target add aarch64-linux-android")
+        .run()
+        .unwrap();
+    cmd!(sh, "rustup target add armv7-linux-androideabi")
+        .run()
+        .unwrap();
+    cmd!(sh, "rustup target add x86_64-linux-android")
+        .run()
+        .unwrap();
+    cmd!(sh, "rustup target add i686-linux-android")
         .run()
         .unwrap();
     cmd!(sh, "cargo install cargo-apk cargo-ndk cbindgen")

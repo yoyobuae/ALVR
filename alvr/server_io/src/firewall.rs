@@ -1,3 +1,5 @@
+use crate::openvrpaths;
+use alvr_packets::FirewallRulesAction;
 use std::{env, fs, path::Path, process::Command};
 
 fn netsh_add_rule_command_string(rule_name: &str, program_path: &Path) -> String {
@@ -16,9 +18,13 @@ fn netsh_delete_rule_command_string(rule_name: &str) -> String {
 // 1: firewall rule is already set
 // 126: pkexec request dismissed
 // other: command failed
-pub fn firewall_rules(add: bool) -> Result<(), i32> {
+pub fn firewall_rules(action: FirewallRulesAction) -> Result<(), i32> {
     let exit_status = if cfg!(target_os = "linux") {
-        let action = if add { "add" } else { "remove" };
+        let action = if matches!(action, FirewallRulesAction::Add) {
+            "add"
+        } else {
+            "remove"
+        };
         // run as normal user since we use pkexec to sudo
         Command::new("bash")
             .arg("/usr/libexec/alvr/alvr_fw_config.sh")
@@ -27,12 +33,12 @@ pub fn firewall_rules(add: bool) -> Result<(), i32> {
             .map_err(|_| -1)?
     } else {
         let script_path = env::temp_dir().join("alvr_firewall_rules.bat");
-        let firewall_rules_script_content = if add {
+        let firewall_rules_script_content = if matches!(action, FirewallRulesAction::Add) {
             format!(
                 "{}\n{}",
                 netsh_add_rule_command_string(
                     "SteamVR ALVR vrserver",
-                    &alvr_commands::steamvr_root_dir()
+                    &openvrpaths::steamvr_root_dir()
                         .map_err(|_| -1)?
                         .join("bin")
                         .join("win64")
@@ -40,7 +46,7 @@ pub fn firewall_rules(add: bool) -> Result<(), i32> {
                 ),
                 netsh_add_rule_command_string(
                     "SteamVR ALVR vrserver",
-                    &alvr_commands::steamvr_root_dir()
+                    &openvrpaths::steamvr_root_dir()
                         .map_err(|_| -1)?
                         .join("bin")
                         .join("win32")

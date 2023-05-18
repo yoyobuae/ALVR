@@ -32,9 +32,11 @@ use alvr_common::{
 };
 use alvr_events::EventType;
 use alvr_filesystem::{self as afs, Layout};
-use alvr_server_data::ServerDataManager;
+use alvr_packets::{
+    ClientListAction, DecoderInitializationConfig, Haptics, ServerControlPacket, VideoPacketHeader,
+};
+use alvr_server_io::ServerDataManager;
 use alvr_session::CodecType;
-use alvr_sockets::{ClientListAction, DecoderInitializationConfig, Haptics, ServerControlPacket};
 use bitrate::BitrateManager;
 use statistics::StatisticsManager;
 use std::{
@@ -45,19 +47,20 @@ use std::{
     ptr,
     sync::{
         self,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Once,
     },
     thread,
     time::{Duration, Instant},
 };
+use sysinfo::{ProcessRefreshKind, RefreshKind, SystemExt};
 use tokio::{
     runtime::Runtime,
     sync::{broadcast, mpsc, Notify},
 };
 
 static FILESYSTEM_LAYOUT: Lazy<Layout> = Lazy::new(|| {
-    afs::filesystem_layout_from_openvr_driver_root_dir(&alvr_commands::get_driver_dir().unwrap())
+    afs::filesystem_layout_from_openvr_driver_root_dir(&alvr_server_io::get_driver_dir().unwrap())
 });
 static SERVER_DATA_MANAGER: Lazy<RwLock<ServerDataManager>> =
     Lazy::new(|| RwLock::new(ServerDataManager::new(&FILESYSTEM_LAYOUT.session())));
@@ -76,13 +79,13 @@ static BITRATE_MANAGER: Lazy<Mutex<BitrateManager>> = Lazy::new(|| {
 });
 
 pub struct VideoPacket {
-    pub timestamp: Duration,
+    pub header: VideoPacketHeader,
     pub payload: Vec<u8>,
 }
 
 static CONTROL_CHANNEL_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<ServerControlPacket>>>> =
     Lazy::new(|| Mutex::new(None));
-static VIDEO_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<VideoPacket>>>> =
+static VIDEO_SENDER: Lazy<Mutex<Option<mpsc::Sender<VideoPacket>>>> =
     Lazy::new(|| Mutex::new(None));
 static HAPTICS_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<Haptics>>>> =
     Lazy::new(|| Mutex::new(None));
@@ -112,11 +115,6 @@ static IS_ALIVE: Lazy<Arc<RelaxedAtomic>> = Lazy::new(|| Arc::new(RelaxedAtomic:
 
 static DECODER_CONFIG: Lazy<Mutex<Option<DecoderInitializationConfig>>> =
     Lazy::new(|| Mutex::new(None));
-
-pub enum WindowType {
-    Alcro(alcro::UI),
-    Browser,
-}
 
 fn to_ffi_quat(quat: Quat) -> FfiQuat {
     FfiQuat {
@@ -164,8 +162,8 @@ pub fn shutdown_tasks() {
         .drivers_backup
         .take()
     {
-        alvr_commands::driver_registration(&backup.other_paths, true).ok();
-        alvr_commands::driver_registration(&[backup.alvr_path], false).ok();
+        alvr_server_io::driver_registration(&backup.other_paths, true).ok();
+        alvr_server_io::driver_registration(&[backup.alvr_path], false).ok();
     }
 
     WEBSERVER_RUNTIME.lock().take();
@@ -182,7 +180,24 @@ pub fn notify_shutdown_driver() {
 }
 
 pub fn notify_restart_driver() {
-    alvr_events::send_event(EventType::ServerRequestsSelfRestart);
+    {
+        let mut system = sysinfo::System::new_with_specifics(
+            RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
+        );
+        system.refresh_processes();
+
+        if system
+            .processes_by_name(afs::dashboard_fname())
+            .next()
+            .is_some()
+        {
+            alvr_events::send_event(EventType::ServerRequestsSelfRestart);
+        } else {
+            error!("Cannot restart SteamVR. No dashboard process found on local device.");
+
+            return;
+        }
+    }
 
     thread::spawn(|| {
         RESTART_NOTIFIER.notify_waiters();
@@ -333,8 +348,14 @@ pub unsafe extern "C" fn HmdDriverFactory(
         });
     }
 
-    extern "C" fn video_send(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32) {
+    extern "C" fn video_send(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32, is_idr: bool) {
+        // start in the corrupts state, the client didn't receive the initial IDR yet.
+        static STREAM_CORRUPTED: AtomicBool = AtomicBool::new(true);
         if let Some(sender) = &*VIDEO_SENDER.lock() {
+            if is_idr {
+                STREAM_CORRUPTED.store(false, Ordering::SeqCst);
+            }
+
             let timestamp = Duration::from_nanos(timestamp_ns);
 
             let mut payload = vec![0; len as _];
@@ -344,15 +365,35 @@ pub unsafe extern "C" fn HmdDriverFactory(
                 ptr::copy_nonoverlapping(buffer_ptr, payload.as_mut_ptr(), len as _);
             }
 
-            if let Some(sender) = &*VIDEO_MIRROR_SENDER.lock() {
-                sender.send(payload.clone()).ok();
-            }
+            if !STREAM_CORRUPTED.load(Ordering::SeqCst)
+                || !SERVER_DATA_MANAGER
+                    .read()
+                    .settings()
+                    .connection
+                    .avoid_video_glitching
+            {
+                if let Some(sender) = &*VIDEO_MIRROR_SENDER.lock() {
+                    sender.send(payload.clone()).ok();
+                }
 
-            if let Some(file) = &mut *VIDEO_RECORDING_FILE.lock() {
-                file.write_all(&payload).ok();
-            }
+                if let Some(file) = &mut *VIDEO_RECORDING_FILE.lock() {
+                    file.write_all(&payload).ok();
+                }
 
-            sender.send(VideoPacket { timestamp, payload }).ok();
+                if sender
+                    .try_send(VideoPacket {
+                        header: VideoPacketHeader { timestamp, is_idr },
+                        payload,
+                    })
+                    .is_err()
+                {
+                    STREAM_CORRUPTED.store(true, Ordering::SeqCst);
+                    unsafe { crate::RequestIDR() };
+                    warn!("Dropping video packet. Reason: Can't push to network");
+                }
+            } else {
+                warn!("Dropping video packet. Reason: Waiting for IDR frame");
+            }
 
             if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
                 stats.report_video_packet(len as _);

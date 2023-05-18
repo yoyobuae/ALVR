@@ -19,13 +19,15 @@ use alvr_common::{
     settings_schema::Switch,
     RelaxedAtomic, DEVICE_ID_TO_PATH, HEAD_ID, LEFT_HAND_ID, RIGHT_HAND_ID,
 };
-use alvr_events::{ButtonEvent, ButtonValue, EventType, HapticsEvent, TrackingEvent};
+use alvr_events::{ButtonEvent, EventType, HapticsEvent, TrackingEvent};
+use alvr_packets::{
+    ButtonValue, ClientConnectionResult, ClientControlPacket, ClientListAction, ClientStatistics,
+    ServerControlPacket, StreamConfigPacket, Tracking, AUDIO, HAPTICS, STATISTICS, TRACKING, VIDEO,
+};
 use alvr_session::{CodecType, ControllersEmulationMode, FrameSize, OpenvrConfig};
 use alvr_sockets::{
-    spawn_cancelable, ClientConnectionResult, ClientControlPacket, ClientListAction,
-    ClientStatistics, ControlSocketReceiver, ControlSocketSender, PeerType, ProtoControlSocket,
-    ServerControlPacket, StreamConfigPacket, StreamSocketBuilder, Tracking, AUDIO, HAPTICS,
-    KEEPALIVE_INTERVAL, STATISTICS, TRACKING, VIDEO,
+    spawn_cancelable, ControlSocketReceiver, ControlSocketSender, PeerType, ProtoControlSocket,
+    StreamSocketBuilder, KEEPALIVE_INTERVAL,
 };
 use futures::future::BoxFuture;
 use std::{
@@ -461,7 +463,7 @@ fn try_connect(
                         fps,
                         frame_interval_sender
                     ) => {
-                        show_warn(res);
+                        warn!("Connection interrupted: {res:?}");
                     },
                     _ = DISCONNECT_CLIENT_NOTIFIER.notified() => (),
                     _ = shutdown_detector => (),
@@ -694,11 +696,12 @@ async fn connection_pipeline(
     let video_send_loop = {
         let mut socket_sender = stream_socket.request_stream(VIDEO).await?;
         async move {
-            let (data_sender, mut data_receiver) = tmpsc::unbounded_channel();
+            let (data_sender, mut data_receiver) =
+                tmpsc::channel(settings.connection.max_queued_server_video_frames);
             *VIDEO_SENDER.lock() = Some(data_sender);
 
-            while let Some(VideoPacket { timestamp, payload }) = data_receiver.recv().await {
-                socket_sender.send(&timestamp, payload).await.ok();
+            while let Some(VideoPacket { header, payload }) = data_receiver.recv().await {
+                socket_sender.send(&header, payload).await.ok();
             }
 
             Ok(())
@@ -772,6 +775,11 @@ async fn connection_pipeline(
             } else {
                 None
             };
+
+            let mut track_controllers = 0u32;
+            if let Switch::Enabled(config) = settings.headset.controllers {
+                track_controllers = config.tracked.into();
+            }
 
             loop {
                 let tracking = receiver.recv_header_only().await?;
@@ -858,6 +866,7 @@ async fn connection_pipeline(
                             } else {
                                 ptr::null()
                             },
+                            track_controllers,
                         )
                     };
                 }
@@ -972,32 +981,43 @@ async fn connection_pipeline(
                         stats.report_battery(packet.device_id, packet.gauge_value);
                     }
                 },
-                Ok(ClientControlPacket::Button { path_id, value }) => {
+                Ok(ClientControlPacket::Buttons(entries)) => {
                     if settings.logging.log_button_presses {
-                        alvr_events::send_event(EventType::Button(ButtonEvent {
-                            path: BUTTON_PATH_FROM_ID
-                                .get(&path_id)
-                                .cloned()
-                                .unwrap_or_else(|| format!("Unknown (ID: {path_id:#16x})")),
-                            value,
-                        }));
+                        alvr_events::send_event(EventType::Buttons(
+                            entries
+                                .iter()
+                                .map(|e| ButtonEvent {
+                                    path: BUTTON_PATH_FROM_ID
+                                        .get(&e.path_id)
+                                        .cloned()
+                                        .unwrap_or_else(|| {
+                                            format!("Unknown (ID: {:#16x})", e.path_id)
+                                        }),
+                                    value: e.value,
+                                })
+                                .collect(),
+                        ));
                     }
 
-                    let value = match value {
-                        ButtonValue::Binary(value) => FfiButtonValue {
-                            type_: crate::FfiButtonType_BUTTON_TYPE_BINARY,
-                            __bindgen_anon_1: crate::FfiButtonValue__bindgen_ty_1 {
-                                binary: value.into(),
+                    for entry in entries {
+                        let value = match entry.value {
+                            ButtonValue::Binary(value) => FfiButtonValue {
+                                type_: crate::FfiButtonType_BUTTON_TYPE_BINARY,
+                                __bindgen_anon_1: crate::FfiButtonValue__bindgen_ty_1 {
+                                    binary: value.into(),
+                                },
                             },
-                        },
 
-                        ButtonValue::Scalar(value) => FfiButtonValue {
-                            type_: crate::FfiButtonType_BUTTON_TYPE_SCALAR,
-                            __bindgen_anon_1: crate::FfiButtonValue__bindgen_ty_1 { scalar: value },
-                        },
-                    };
+                            ButtonValue::Scalar(value) => FfiButtonValue {
+                                type_: crate::FfiButtonType_BUTTON_TYPE_SCALAR,
+                                __bindgen_anon_1: crate::FfiButtonValue__bindgen_ty_1 {
+                                    scalar: value,
+                                },
+                            },
+                        };
 
-                    unsafe { crate::SetButton(path_id, value) };
+                        unsafe { crate::SetButton(entry.path_id, value) };
+                    }
                 }
                 Ok(ClientControlPacket::Log { level, message }) => {
                     info!("Client {client_hostname}: [{level:?}] {message}")
