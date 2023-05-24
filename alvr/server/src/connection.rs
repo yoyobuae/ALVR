@@ -2,7 +2,7 @@ use crate::{
     bitrate::BitrateManager,
     buttons::BUTTON_PATH_FROM_ID,
     face_tracking::FaceTrackingSink,
-    haptics::HapticsManager,
+    haptics,
     sockets::WelcomeSocket,
     statistics::StatisticsManager,
     tracking::{self, TrackingManager},
@@ -58,7 +58,7 @@ fn align32(value: f32) -> u32 {
 }
 
 // Alternate connection trials with manual IPs and clients discovered on the local network
-pub fn handshake_loop(frame_interval_sender: smpsc::Sender<Duration>) -> IntResult {
+pub fn handshake_loop() -> IntResult {
     let mut welcome_socket = WelcomeSocket::new().map_err(to_int_e!())?;
 
     loop {
@@ -77,9 +77,7 @@ pub fn handshake_loop(frame_interval_sender: smpsc::Sender<Duration>) -> IntResu
             manual_client_ips
         };
 
-        if !manual_client_ips.is_empty()
-            && try_connect(manual_client_ips, frame_interval_sender.clone()).is_ok()
-        {
+        if !manual_client_ips.is_empty() && try_connect(manual_client_ips).is_ok() {
             thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
             continue;
         }
@@ -128,10 +126,9 @@ pub fn handshake_loop(frame_interval_sender: smpsc::Sender<Duration>) -> IntResu
 
             // do not attempt connection if the client is already connected
             if trusted && !CONNECTED_CLIENT_HOSTNAMES.lock().contains(&client_hostname) {
-                if let Err(e) = try_connect(
-                    [(client_ip, client_hostname.clone())].into_iter().collect(),
-                    frame_interval_sender.clone(),
-                ) {
+                if let Err(e) =
+                    try_connect([(client_ip, client_hostname.clone())].into_iter().collect())
+                {
                     error!("Handshake error for {client_hostname}: {e}");
                 }
             }
@@ -141,10 +138,7 @@ pub fn handshake_loop(frame_interval_sender: smpsc::Sender<Duration>) -> IntResu
     }
 }
 
-fn try_connect(
-    mut client_ips: HashMap<IpAddr, String>,
-    frame_interval_sender: smpsc::Sender<Duration>,
-) -> IntResult {
+fn try_connect(mut client_ips: HashMap<IpAddr, String>) -> IntResult {
     let runtime = Runtime::new().map_err(to_int_e!())?;
 
     let (mut proto_socket, client_ip) = runtime
@@ -170,11 +164,20 @@ fn try_connect(
     );
 
     let maybe_streaming_caps = if let ClientConnectionResult::ConnectionAccepted {
+        client_protocol_id,
         display_name,
         streaming_capabilities,
         ..
     } = runtime.block_on(proto_socket.recv()).map_err(to_int_e!())?
     {
+        if client_protocol_id != alvr_common::protocol_id() {
+            warn!(
+                "Trusted client is incompatible! Expected protocol ID: {}, found: {}",
+                alvr_common::protocol_id(),
+                client_protocol_id,
+            );
+        }
+
         SERVER_DATA_MANAGER.write().update_client_list(
             client_hostname.clone(),
             ClientListAction::SetDisplayName(display_name),
@@ -461,9 +464,10 @@ fn try_connect(
                         control_receiver,
                         streaming_caps.microphone_sample_rate,
                         fps,
-                        frame_interval_sender
                     ) => {
-                        warn!("Connection interrupted: {res:?}");
+                        if let Err(e) = res {
+                            warn!("Connection interrupted: {e:?}");
+                        }
                     },
                     _ = DISCONNECT_CLIENT_NOTIFIER.notified() => (),
                     _ = shutdown_detector => (),
@@ -522,7 +526,6 @@ async fn connection_pipeline(
     mut control_receiver: ControlSocketReceiver<ClientControlPacket>,
     microphone_sample_rate: u32,
     refresh_rate: f32,
-    frame_interval_sender: smpsc::Sender<Duration>,
 ) -> StrResult {
     let control_sender = Arc::new(Mutex::new(control_sender));
 
@@ -570,15 +573,9 @@ async fn connection_pipeline(
     ));
 
     *BITRATE_MANAGER.lock() = BitrateManager::new(
-        settings.video.bitrate,
         settings.connection.statistics_history_size as _,
         refresh_rate,
     );
-
-    // todo: dynamic framerate
-    frame_interval_sender
-        .send(Duration::from_secs_f32(1.0 / refresh_rate))
-        .ok();
 
     {
         let on_connect_script = settings.connection.on_connect_script;
@@ -710,31 +707,41 @@ async fn connection_pipeline(
 
     let haptics_send_loop = {
         let mut socket_sender = stream_socket.request_stream(HAPTICS).await?;
-        let controllers_desc = settings.headset.controllers.clone();
         async move {
             let (data_sender, mut data_receiver) = tmpsc::unbounded_channel();
             *HAPTICS_SENDER.lock() = Some(data_sender);
 
-            let haptics_manager = controllers_desc
-                .into_option()
-                .and_then(|c| c.haptics.into_option())
-                .map(HapticsManager::new);
-
             while let Some(haptics) = data_receiver.recv().await {
-                if settings.logging.log_haptics {
-                    alvr_events::send_event(EventType::Haptics(HapticsEvent {
-                        path: DEVICE_ID_TO_PATH
-                            .get(&haptics.device_id)
-                            .map(|p| (*p).to_owned())
-                            .unwrap_or_else(|| format!("Unknown (ID: {:#16x})", haptics.device_id)),
-                        duration: haptics.duration,
-                        frequency: haptics.frequency,
-                        amplitude: haptics.amplitude,
-                    }))
-                }
+                let haptics_config = {
+                    let data_manager_lock = SERVER_DATA_MANAGER.read();
 
-                if let Some(manager) = &haptics_manager {
-                    socket_sender.send(&manager.map(haptics), vec![]).await.ok();
+                    if data_manager_lock.settings().logging.log_haptics {
+                        alvr_events::send_event(EventType::Haptics(HapticsEvent {
+                            path: DEVICE_ID_TO_PATH
+                                .get(&haptics.device_id)
+                                .map(|p| (*p).to_owned())
+                                .unwrap_or_else(|| {
+                                    format!("Unknown (ID: {:#16x})", haptics.device_id)
+                                }),
+                            duration: haptics.duration,
+                            frequency: haptics.frequency,
+                            amplitude: haptics.amplitude,
+                        }))
+                    }
+
+                    data_manager_lock
+                        .settings()
+                        .headset
+                        .controllers
+                        .as_option()
+                        .and_then(|c| c.haptics.as_option().cloned())
+                };
+
+                if let Some(config) = haptics_config {
+                    socket_sender
+                        .send(&haptics::map_haptics(&config, haptics), vec![])
+                        .await
+                        .ok();
                 }
             }
 
@@ -758,7 +765,7 @@ async fn connection_pipeline(
         });
     }
 
-    let tracking_manager = Arc::new(Mutex::new(TrackingManager::new(&settings.headset)));
+    let tracking_manager = Arc::new(Mutex::new(TrackingManager::new()));
 
     let tracking_receive_loop = {
         let mut receiver = stream_socket
@@ -786,18 +793,26 @@ async fn connection_pipeline(
 
                 let mut tracking_manager_lock = tracking_manager.lock().await;
 
-                let motions = tracking_manager_lock.transform_motions(
-                    &tracking.device_motions,
-                    [
-                        tracking.hand_skeletons[0].is_some(),
-                        tracking.hand_skeletons[1].is_some(),
-                    ],
-                );
+                let motions;
+                let left_hand_skeleton;
+                let right_hand_skeleton;
+                {
+                    let data_manager_lock = SERVER_DATA_MANAGER.read();
+                    let config = &data_manager_lock.settings().headset;
+                    motions = tracking_manager_lock.transform_motions(
+                        config,
+                        &tracking.device_motions,
+                        [
+                            tracking.hand_skeletons[0].is_some(),
+                            tracking.hand_skeletons[1].is_some(),
+                        ],
+                    );
 
-                let left_hand_skeleton = tracking.hand_skeletons[0]
-                    .map(|s| tracking_manager_lock.to_openvr_hand_skeleton(*LEFT_HAND_ID, s));
-                let right_hand_skeleton = tracking.hand_skeletons[1]
-                    .map(|s| tracking_manager_lock.to_openvr_hand_skeleton(*RIGHT_HAND_ID, s));
+                    left_hand_skeleton = tracking.hand_skeletons[0]
+                        .map(|s| tracking::to_openvr_hand_skeleton(config, *LEFT_HAND_ID, s));
+                    right_hand_skeleton = tracking.hand_skeletons[1]
+                        .map(|s| tracking::to_openvr_hand_skeleton(config, *RIGHT_HAND_ID, s));
+                }
 
                 // Note: using the raw unrecentered head
                 let local_eye_gazes = tracking
@@ -807,28 +822,31 @@ async fn connection_pipeline(
                     .map(|(_, m)| tracking::to_local_eyes(m.pose, tracking.face_data.eye_gazes))
                     .unwrap_or_default();
 
-                if settings.logging.log_tracking {
-                    alvr_events::send_event(EventType::Tracking(Box::new(TrackingEvent {
-                        head_motion: motions
-                            .iter()
-                            .find(|(id, _)| *id == *HEAD_ID)
-                            .map(|(_, m)| *m),
-                        controller_motions: [
-                            motions
+                {
+                    let data_manager_lock = SERVER_DATA_MANAGER.read();
+                    if data_manager_lock.settings().logging.log_tracking {
+                        alvr_events::send_event(EventType::Tracking(Box::new(TrackingEvent {
+                            head_motion: motions
                                 .iter()
-                                .find(|(id, _)| *id == *LEFT_HAND_ID)
+                                .find(|(id, _)| *id == *HEAD_ID)
                                 .map(|(_, m)| *m),
-                            motions
-                                .iter()
-                                .find(|(id, _)| *id == *RIGHT_HAND_ID)
-                                .map(|(_, m)| *m),
-                        ],
-                        hand_skeletons: [left_hand_skeleton, right_hand_skeleton],
-                        eye_gazes: local_eye_gazes,
-                        fb_face_expression: tracking.face_data.fb_face_expression.clone(),
-                        htc_eye_expression: tracking.face_data.htc_eye_expression.clone(),
-                        htc_lip_expression: tracking.face_data.htc_lip_expression.clone(),
-                    })))
+                            controller_motions: [
+                                motions
+                                    .iter()
+                                    .find(|(id, _)| *id == *LEFT_HAND_ID)
+                                    .map(|(_, m)| *m),
+                                motions
+                                    .iter()
+                                    .find(|(id, _)| *id == *RIGHT_HAND_ID)
+                                    .map(|(_, m)| *m),
+                            ],
+                            hand_skeletons: [left_hand_skeleton, right_hand_skeleton],
+                            eye_gazes: local_eye_gazes,
+                            fb_face_expression: tracking.face_data.fb_face_expression.clone(),
+                            htc_eye_expression: tracking.face_data.htc_eye_expression.clone(),
+                            htc_lip_expression: tracking.face_data.htc_lip_expression.clone(),
+                        })))
+                    }
                 }
 
                 if let Some(sink) = &face_tracking_sink {
@@ -888,6 +906,7 @@ async fn connection_pipeline(
                     let network_latency = stats.report_statistics(client_stats);
 
                     BITRATE_MANAGER.lock().report_frame_latencies(
+                        &SERVER_DATA_MANAGER.read().settings().video.bitrate.mode,
                         timestamp,
                         network_latency,
                         decoder_latency,
@@ -936,7 +955,12 @@ async fn connection_pipeline(
                     if !is_tracking_ref_only {
                         playspace_sync_sender.send(packet).ok();
 
-                        tracking_manager.lock().await.recenter();
+                        let data_manager_lock = SERVER_DATA_MANAGER.read();
+                        let config = &data_manager_lock.settings().headset;
+                        tracking_manager.lock().await.recenter(
+                            config.position_recentering_mode,
+                            config.rotation_recentering_mode,
+                        );
                     }
                 }
                 Ok(ClientControlPacket::RequestIdr) => {
@@ -982,21 +1006,24 @@ async fn connection_pipeline(
                     }
                 },
                 Ok(ClientControlPacket::Buttons(entries)) => {
-                    if settings.logging.log_button_presses {
-                        alvr_events::send_event(EventType::Buttons(
-                            entries
-                                .iter()
-                                .map(|e| ButtonEvent {
-                                    path: BUTTON_PATH_FROM_ID
-                                        .get(&e.path_id)
-                                        .cloned()
-                                        .unwrap_or_else(|| {
-                                            format!("Unknown (ID: {:#16x})", e.path_id)
-                                        }),
-                                    value: e.value,
-                                })
-                                .collect(),
-                        ));
+                    {
+                        let data_manager_lock = SERVER_DATA_MANAGER.read();
+                        if data_manager_lock.settings().logging.log_button_presses {
+                            alvr_events::send_event(EventType::Buttons(
+                                entries
+                                    .iter()
+                                    .map(|e| ButtonEvent {
+                                        path: BUTTON_PATH_FROM_ID
+                                            .get(&e.path_id)
+                                            .cloned()
+                                            .unwrap_or_else(|| {
+                                                format!("Unknown (ID: {:#16x})", e.path_id)
+                                            }),
+                                        value: e.value,
+                                    })
+                                    .collect(),
+                            ));
+                        }
                     }
 
                     for entry in entries {

@@ -46,7 +46,6 @@ use std::{
     io::Write,
     ptr,
     sync::{
-        self,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Once,
     },
@@ -56,7 +55,11 @@ use std::{
 use sysinfo::{ProcessRefreshKind, RefreshKind, SystemExt};
 use tokio::{
     runtime::Runtime,
-    sync::{broadcast, mpsc, Notify},
+    sync::{
+        broadcast,
+        mpsc::{self, error::TrySendError},
+        Notify,
+    },
 };
 
 static FILESYSTEM_LAYOUT: Lazy<Layout> = Lazy::new(|| {
@@ -72,7 +75,6 @@ static BITRATE_MANAGER: Lazy<Mutex<BitrateManager>> = Lazy::new(|| {
     let data_lock = SERVER_DATA_MANAGER.read();
     let settings = data_lock.settings();
     Mutex::new(BitrateManager::new(
-        settings.video.bitrate.clone(),
         settings.connection.statistics_history_size as usize,
         settings.video.preferred_fps,
     ))
@@ -380,13 +382,13 @@ pub unsafe extern "C" fn HmdDriverFactory(
                     file.write_all(&payload).ok();
                 }
 
-                if sender
-                    .try_send(VideoPacket {
+                if matches!(
+                    sender.try_send(VideoPacket {
                         header: VideoPacketHeader { timestamp, is_idr },
                         payload,
-                    })
-                    .is_err()
-                {
+                    }),
+                    Err(TrySendError::Full(_))
+                ) {
                     STREAM_CORRUPTED.store(true, Ordering::SeqCst);
                     unsafe { crate::RequestIDR() };
                     warn!("Dropping video packet. Reason: Can't push to network");
@@ -420,8 +422,6 @@ pub unsafe extern "C" fn HmdDriverFactory(
     pub extern "C" fn driver_ready_idle(set_default_chap: bool) {
         IS_ALIVE.set(true);
 
-        let (frame_interval_sender, frame_interval_receiver) = sync::mpsc::channel();
-
         thread::spawn(move || {
             if set_default_chap {
                 // call this when inside a new tokio thread. Calling this on the parent thread will
@@ -429,31 +429,10 @@ pub unsafe extern "C" fn HmdDriverFactory(
                 unsafe { SetChaperone(2.0, 2.0) };
             }
 
-            if let Err(InterruptibleError::Other(e)) =
-                connection::handshake_loop(frame_interval_sender)
-            {
+            if let Err(InterruptibleError::Other(e)) = connection::handshake_loop() {
                 warn!("Connection thread closed: {e}");
             }
         });
-
-        if cfg!(windows) {
-            // Vsync thread
-            thread::spawn(move || {
-                let mut frame_interval = Duration::from_millis(20);
-                let mut deadline = Instant::now();
-
-                while IS_ALIVE.value() {
-                    unsafe { crate::SendVSync() };
-
-                    while let Ok(interval) = frame_interval_receiver.try_recv() {
-                        frame_interval = interval;
-                    }
-
-                    deadline += frame_interval;
-                    spin_sleep::sleep(deadline.saturating_duration_since(Instant::now()));
-                }
-            });
-        }
     }
 
     extern "C" fn _shutdown_runtime() {
@@ -472,7 +451,14 @@ pub unsafe extern "C" fn HmdDriverFactory(
             );
         }
 
-        BITRATE_MANAGER.lock().report_frame_present();
+        BITRATE_MANAGER.lock().report_frame_present(
+            &SERVER_DATA_MANAGER
+                .read()
+                .settings()
+                .video
+                .bitrate
+                .adapt_to_framerate,
+        );
     }
 
     extern "C" fn report_composed(timestamp_ns: u64, offset_ns: u64) {
@@ -491,7 +477,20 @@ pub unsafe extern "C" fn HmdDriverFactory(
     }
 
     extern "C" fn get_dynamic_encoder_params() -> FfiDynamicEncoderParams {
-        BITRATE_MANAGER.lock().get_encoder_params()
+        BITRATE_MANAGER
+            .lock()
+            .get_encoder_params(&SERVER_DATA_MANAGER.read().settings().video.bitrate)
+    }
+
+    extern "C" fn wait_for_vsync() {
+        let wait_duration = STATISTICS_MANAGER
+            .lock()
+            .as_mut()
+            .map(|stats| stats.duration_until_next_vsync());
+
+        if let Some(duration) = wait_duration {
+            thread::sleep(duration);
+        }
     }
 
     LogError = Some(log_error);
@@ -511,6 +510,7 @@ pub unsafe extern "C" fn HmdDriverFactory(
     GetSerialNumber = Some(openvr_props::get_serial_number);
     SetOpenvrProps = Some(openvr_props::set_device_openvr_props);
     GetDynamicEncoderParams = Some(get_dynamic_encoder_params);
+    WaitForVSync = Some(wait_for_vsync);
 
     // cast to usize to allow the variables to cross thread boundaries
     let interface_name_usize = interface_name as usize;
