@@ -2,4 +2,4 @@ version: "1"
 rules:
   - base: master
     upstream: alvr-org:master
-    mergeMethod: rebase
+    mergeMethod: merge
