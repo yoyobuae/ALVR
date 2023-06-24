@@ -4,9 +4,10 @@ mod components;
 use self::components::{
     ConnectionsTab, LogsTab, NotificationBar, SettingsTab, SetupWizard, SetupWizardRequest,
 };
-use crate::{dashboard::components::StatisticsTab, theme, DataSources};
+use crate::{dashboard::components::StatisticsTab, DataSources};
 use alvr_common::parking_lot::{Condvar, Mutex};
 use alvr_events::EventType;
+use alvr_gui_common::theme;
 use alvr_packets::{PathValuePair, ServerRequest};
 use alvr_session::SessionConfig;
 use eframe::egui::{
@@ -78,7 +79,7 @@ pub struct Dashboard {
 
 impl Dashboard {
     pub fn new(creation_context: &eframe::CreationContext<'_>, data_sources: DataSources) -> Self {
-        theme::set_theme(&creation_context.egui_ctx);
+        alvr_gui_common::theme::set_theme(&creation_context.egui_ctx);
 
         // Audio devices need to be queried early to mitigate buggy/slow hardware queries on Linux.
         data_sources.request(ServerRequest::GetSession);
@@ -158,7 +159,7 @@ impl eframe::App for Dashboard {
                 EventType::GraphStatistics(graph_statistics) => self
                     .statistics_tab
                     .update_graph_statistics(graph_statistics),
-                EventType::Statistics(statistics) => {
+                EventType::StatisticsSummary(statistics) => {
                     self.statistics_tab.update_statistics(statistics)
                 }
                 EventType::Session(session) => {
@@ -231,7 +232,7 @@ impl eframe::App for Dashboard {
                         .inner_margin(Margin::same(7.0))
                         .stroke(Stroke::new(1.0, theme::SEPARATOR_BG)),
                 )
-                .exact_width(150.0)
+                .exact_width(145.0)
                 .show(context, |ui| {
                     ui.with_layout(Layout::top_down_justified(Align::Center), |ui| {
                         ui.add_space(13.0);

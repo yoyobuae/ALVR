@@ -267,7 +267,7 @@ pub enum BitrateMode {
 
         #[schema(strings(display_name = "Minimum bitrate"))]
         #[schema(flag = "real-time")]
-        #[schema(gui(slider(min = 1, max = 1000, logarithmic)), suffix = "Mbps")]
+        #[schema(gui(slider(min = 1, max = 100, logarithmic)), suffix = "Mbps")]
         min_bitrate_mbps: Switch<u64>,
 
         #[schema(strings(display_name = "Maximum network latency"))]
@@ -289,7 +289,8 @@ pub enum BitrateMode {
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
 pub struct BitrateAdaptiveFramerateConfig {
     #[schema(strings(
-        help = "If the framerate changes more than this factor, trigger a parameters update"
+        display_name = "FPS reset threshold multiplier",
+        help = "If the framerate changes more than this factor, trigger a parameters update",
     ))]
     #[schema(flag = "real-time")]
     #[schema(gui(slider(min = 1.0, max = 3.0, step = 0.1)))]

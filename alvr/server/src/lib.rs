@@ -31,9 +31,7 @@ use alvr_common::{
 };
 use alvr_events::EventType;
 use alvr_filesystem::{self as afs, Layout};
-use alvr_packets::{
-    ClientListAction, DecoderInitializationConfig, Haptics, ServerControlPacket, VideoPacketHeader,
-};
+use alvr_packets::{ClientListAction, DecoderInitializationConfig, VideoPacketHeader};
 use alvr_server_io::ServerDataManager;
 use alvr_session::CodecType;
 use bitrate::BitrateManager;
@@ -45,21 +43,14 @@ use std::{
     fs::File,
     io::Write,
     ptr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Once,
-    },
+    sync::Once,
     thread,
     time::{Duration, Instant},
 };
 use sysinfo::{ProcessRefreshKind, RefreshKind, SystemExt};
 use tokio::{
     runtime::Runtime,
-    sync::{
-        broadcast,
-        mpsc::{self, error::TrySendError},
-        Notify,
-    },
+    sync::{broadcast, Notify},
 };
 
 static FILESYSTEM_LAYOUT: Lazy<Layout> = Lazy::new(|| {
@@ -85,18 +76,13 @@ pub struct VideoPacket {
     pub payload: Vec<u8>,
 }
 
-static CONTROL_CHANNEL_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<ServerControlPacket>>>> =
-    Lazy::new(|| Mutex::new(None));
-static VIDEO_SENDER: Lazy<Mutex<Option<mpsc::Sender<VideoPacket>>>> =
-    Lazy::new(|| Mutex::new(None));
-static HAPTICS_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<Haptics>>>> =
-    Lazy::new(|| Mutex::new(None));
 static VIDEO_MIRROR_SENDER: Lazy<Mutex<Option<broadcast::Sender<Vec<u8>>>>> =
     Lazy::new(|| Mutex::new(None));
 static VIDEO_RECORDING_FILE: Lazy<Mutex<Option<File>>> = Lazy::new(|| Mutex::new(None));
 
 static DISCONNECT_CLIENT_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
 static RESTART_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
+static SHUTDOWN_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
 
 static FRAME_RENDER_VS_CSO: &[u8] = include_bytes!("../cpp/platform/win32/FrameRenderVS.cso");
 static FRAME_RENDER_PS_CSO: &[u8] = include_bytes!("../cpp/platform/win32/FrameRenderPS.cso");
@@ -155,6 +141,10 @@ pub extern "C" fn shutdown_driver() {
     // Invoke connection runtimes shutdown
     // todo: block until they shutdown
     SHOULD_CONNECT_TO_CLIENTS.set(false);
+    SHUTDOWN_NOTIFIER.notify_waiters();
+
+    // give time to the sockets to communucate with the client
+    thread::sleep(Duration::from_millis(200));
 
     // apply openvr config for the next launch
     SERVER_DATA_MANAGER.write().session_mut().openvr_config = connection::contruct_openvr_config();
@@ -195,9 +185,6 @@ pub fn notify_restart_driver() {
 pub fn restart_driver() {
     SHOULD_CONNECT_TO_CLIENTS.set(false);
     RESTART_NOTIFIER.notify_waiters();
-
-    // give time to the control loop to send the restart packet (not crucial)
-    thread::sleep(Duration::from_millis(200));
 
     shutdown_driver();
 }
@@ -339,79 +326,6 @@ pub unsafe extern "C" fn HmdDriverFactory(
         });
     }
 
-    extern "C" fn video_send(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32, is_idr: bool) {
-        // start in the corrupts state, the client didn't receive the initial IDR yet.
-        static STREAM_CORRUPTED: AtomicBool = AtomicBool::new(true);
-        if let Some(sender) = &*VIDEO_SENDER.lock() {
-            if is_idr {
-                STREAM_CORRUPTED.store(false, Ordering::SeqCst);
-            }
-
-            let timestamp = Duration::from_nanos(timestamp_ns);
-
-            let mut payload = vec![0; len as _];
-
-            // use copy_nonoverlapping (aka memcpy) to avoid freeing memory allocated by C++
-            unsafe {
-                ptr::copy_nonoverlapping(buffer_ptr, payload.as_mut_ptr(), len as _);
-            }
-
-            if !STREAM_CORRUPTED.load(Ordering::SeqCst)
-                || !SERVER_DATA_MANAGER
-                    .read()
-                    .settings()
-                    .connection
-                    .avoid_video_glitching
-            {
-                if let Some(sender) = &*VIDEO_MIRROR_SENDER.lock() {
-                    sender.send(payload.clone()).ok();
-                }
-
-                if let Some(file) = &mut *VIDEO_RECORDING_FILE.lock() {
-                    file.write_all(&payload).ok();
-                }
-
-                if matches!(
-                    sender.try_send(VideoPacket {
-                        header: VideoPacketHeader { timestamp, is_idr },
-                        payload,
-                    }),
-                    Err(TrySendError::Full(_))
-                ) {
-                    STREAM_CORRUPTED.store(true, Ordering::SeqCst);
-                    unsafe { crate::RequestIDR() };
-                    warn!("Dropping video packet. Reason: Can't push to network");
-                }
-            } else {
-                warn!("Dropping video packet. Reason: Waiting for IDR frame");
-            }
-
-            if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
-                let encoder_latency =
-                    stats.report_frame_encoded(Duration::from_nanos(timestamp_ns), len as _);
-
-                BITRATE_MANAGER.lock().report_frame_encoded(
-                    timestamp,
-                    encoder_latency,
-                    len as usize,
-                );
-            }
-        }
-    }
-
-    extern "C" fn haptics_send(device_id: u64, duration_s: f32, frequency: f32, amplitude: f32) {
-        if let Some(sender) = &*HAPTICS_SENDER.lock() {
-            let haptics = Haptics {
-                device_id,
-                duration: Duration::from_secs_f32(f32::max(duration_s, 0.0)),
-                frequency,
-                amplitude,
-            };
-
-            sender.send(haptics).ok();
-        }
-    }
-
     pub extern "C" fn driver_ready_idle(set_default_chap: bool) {
         SHOULD_CONNECT_TO_CLIENTS.set(true);
 
@@ -460,9 +374,17 @@ pub unsafe extern "C" fn HmdDriverFactory(
     }
 
     extern "C" fn get_dynamic_encoder_params() -> FfiDynamicEncoderParams {
-        BITRATE_MANAGER
+        let (params, stats) = BITRATE_MANAGER
             .lock()
-            .get_encoder_params(&SERVER_DATA_MANAGER.read().settings().video.bitrate)
+            .get_encoder_params(&SERVER_DATA_MANAGER.read().settings().video.bitrate);
+
+        if let Some(stats) = stats {
+            if let Some(stats_manager) = &mut *STATISTICS_MANAGER.lock() {
+                stats_manager.report_nominal_bitrate_stats(stats);
+            }
+        }
+
+        params
     }
 
     extern "C" fn wait_for_vsync() {
@@ -472,6 +394,7 @@ pub unsafe extern "C" fn HmdDriverFactory(
             .video
             .optimize_game_render_latency
         {
+            // Note: unlock STATISTICS_MANAGER as soon as possible
             let wait_duration = STATISTICS_MANAGER
                 .lock()
                 .as_mut()
@@ -490,8 +413,8 @@ pub unsafe extern "C" fn HmdDriverFactory(
     LogPeriodically = Some(log_periodically);
     DriverReadyIdle = Some(driver_ready_idle);
     InitializeDecoder = Some(initialize_decoder);
-    VideoSend = Some(video_send);
-    HapticsSend = Some(haptics_send);
+    VideoSend = Some(connection::send_video);
+    HapticsSend = Some(connection::send_haptics);
     ShutdownRuntime = Some(shutdown_driver);
     PathStringToHash = Some(path_string_to_hash);
     ReportPresent = Some(report_present);

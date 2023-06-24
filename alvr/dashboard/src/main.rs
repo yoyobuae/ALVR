@@ -2,7 +2,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod dashboard;
-mod theme;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod data_sources;
@@ -80,7 +79,7 @@ fn main() {
                 width: image.width(),
                 height: image.height(),
             }),
-            initial_window_size: Some(egui::vec2(900.0, 600.0)),
+            initial_window_size: Some(egui::vec2(870.0, 600.0)),
             centered: true,
             ..Default::default()
         },
