@@ -33,9 +33,9 @@ use alvr_events::EventType;
 use alvr_filesystem::{self as afs, Layout};
 use alvr_packets::{ClientListAction, DecoderInitializationConfig, VideoPacketHeader};
 use alvr_server_io::ServerDataManager;
-use alvr_session::CodecType;
+use alvr_session::{CodecType, ConnectionState};
 use bitrate::BitrateManager;
-use connection::SHOULD_CONNECT_TO_CLIENTS;
+use connection::{ClientDisconnectRequest, DISCONNECT_CLIENT_NOTIFIER, SHOULD_CONNECT_TO_CLIENTS};
 use statistics::StatisticsManager;
 use std::{
     collections::HashMap,
@@ -48,10 +48,7 @@ use std::{
     time::{Duration, Instant},
 };
 use sysinfo::{ProcessRefreshKind, RefreshKind, SystemExt};
-use tokio::{
-    runtime::Runtime,
-    sync::{broadcast, Notify},
-};
+use tokio::{runtime::Runtime, sync::broadcast};
 
 static FILESYSTEM_LAYOUT: Lazy<Layout> = Lazy::new(|| {
     afs::filesystem_layout_from_openvr_driver_root_dir(&alvr_server_io::get_driver_dir().unwrap())
@@ -80,9 +77,8 @@ static VIDEO_MIRROR_SENDER: Lazy<Mutex<Option<broadcast::Sender<Vec<u8>>>>> =
     Lazy::new(|| Mutex::new(None));
 static VIDEO_RECORDING_FILE: Lazy<Mutex<Option<File>>> = Lazy::new(|| Mutex::new(None));
 
-static DISCONNECT_CLIENT_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
-static RESTART_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
-static SHUTDOWN_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
+// static DISCONNECT_CLIENT_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
+// static RESTART_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
 
 static FRAME_RENDER_VS_CSO: &[u8] = include_bytes!("../cpp/platform/win32/FrameRenderVS.cso");
 static FRAME_RENDER_PS_CSO: &[u8] = include_bytes!("../cpp/platform/win32/FrameRenderPS.cso");
@@ -141,10 +137,35 @@ pub extern "C" fn shutdown_driver() {
     // Invoke connection runtimes shutdown
     // todo: block until they shutdown
     SHOULD_CONNECT_TO_CLIENTS.set(false);
-    SHUTDOWN_NOTIFIER.notify_waiters();
 
-    // give time to the sockets to communucate with the client
-    thread::sleep(Duration::from_millis(200));
+    {
+        let mut data_manager_lock = SERVER_DATA_MANAGER.write();
+
+        let hostnames = data_manager_lock
+            .client_list()
+            .iter()
+            .filter_map(|(hostname, info)| {
+                (!matches!(
+                    info.connection_state,
+                    ConnectionState::Disconnected | ConnectionState::Disconnecting { .. }
+                ))
+                .then(|| hostname.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for hostname in hostnames {
+            data_manager_lock.update_client_list(
+                hostname,
+                ClientListAction::SetConnectionState(ConnectionState::Disconnecting {
+                    should_be_removed: false,
+                }),
+            );
+        }
+    }
+
+    if let Some(notifier) = &*DISCONNECT_CLIENT_NOTIFIER.lock() {
+        notifier.send(ClientDisconnectRequest::ServerShutdown).ok();
+    }
 
     // apply openvr config for the next launch
     SERVER_DATA_MANAGER.write().session_mut().openvr_config = connection::contruct_openvr_config();
@@ -157,6 +178,15 @@ pub extern "C" fn shutdown_driver() {
     {
         alvr_server_io::driver_registration(&backup.other_paths, true).ok();
         alvr_server_io::driver_registration(&[backup.alvr_path], false).ok();
+    }
+
+    while SERVER_DATA_MANAGER
+        .read()
+        .client_list()
+        .iter()
+        .any(|(_, info)| info.connection_state != ConnectionState::Disconnected)
+    {
+        thread::sleep(Duration::from_millis(100));
     }
 
     WEBSERVER_RUNTIME.lock().take();
@@ -184,7 +214,9 @@ pub fn notify_restart_driver() {
 // This call is blocking
 pub fn restart_driver() {
     SHOULD_CONNECT_TO_CLIENTS.set(false);
-    RESTART_NOTIFIER.notify_waiters();
+    if let Some(notifier) = &*DISCONNECT_CLIENT_NOTIFIER.lock() {
+        notifier.send(ClientDisconnectRequest::ServerRestart).ok();
+    }
 
     shutdown_driver();
 }
@@ -199,24 +231,7 @@ fn init() {
         )));
     }
 
-    {
-        let mut data_manager_lock = SERVER_DATA_MANAGER.write();
-
-        let connections = data_manager_lock.session().client_connections.clone();
-        for (hostname, connection) in connections {
-            if !connection.trusted {
-                data_manager_lock.update_client_list(hostname, ClientListAction::RemoveEntry);
-            }
-        }
-
-        for conn in data_manager_lock
-            .session_mut()
-            .client_connections
-            .values_mut()
-        {
-            conn.current_ip = None;
-        }
-    }
+    SERVER_DATA_MANAGER.write().clean_client_list();
 
     unsafe {
         g_sessionPath = CString::new(FILESYSTEM_LAYOUT.session().to_string_lossy().to_string())
@@ -331,14 +346,12 @@ pub unsafe extern "C" fn HmdDriverFactory(
 
         thread::spawn(move || {
             if set_default_chap {
-                // call this when inside a new tokio thread. Calling this on the parent thread will
-                // crash SteamVR
+                // call this when inside a new thread. Calling this on the parent thread will crash
+                // SteamVR
                 unsafe { SetChaperone(2.0, 2.0) };
             }
 
-            if let Err(InterruptibleError::Other(e)) = connection::handshake_loop() {
-                warn!("Connection thread closed: {e}");
-            }
+            connection::handshake_loop();
         });
     }
 

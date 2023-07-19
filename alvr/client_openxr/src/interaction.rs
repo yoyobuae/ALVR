@@ -470,7 +470,7 @@ pub fn get_hand_motion(
         {
             if joint_locations[0]
                 .location_flags
-                .contains(xr::SpaceLocationFlags::POSITION_TRACKED)
+                .contains(xr::SpaceLocationFlags::POSITION_VALID)
             {
                 *last_position = to_vec3(joint_locations[0].pose.position);
             }
@@ -510,9 +510,16 @@ pub fn get_hand_motion(
         return (None, None);
     };
 
+    if !location
+        .location_flags
+        .contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
+    {
+        return (None, None);
+    }
+
     if location
         .location_flags
-        .contains(xr::SpaceLocationFlags::POSITION_TRACKED)
+        .contains(xr::SpaceLocationFlags::POSITION_VALID)
     {
         *last_position = to_vec3(location.pose.position);
     }

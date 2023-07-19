@@ -13,16 +13,15 @@ use bytes::{Buf, BufMut, BytesMut};
 use futures::SinkExt;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     marker::PhantomData,
-    mem,
     net::IpAddr,
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::mpsc::{self, RecvTimeoutError},
+    time::Duration,
 };
 use tcp::{TcpStreamReceiveSocket, TcpStreamSendSocket};
-use tokio::net;
-use tokio::sync::{mpsc, Mutex};
+use tokio::{net, runtime::Runtime};
 use udp::{UdpStreamReceiveSocket, UdpStreamSendSocket};
 
 pub fn set_socket_buffers(
@@ -125,27 +124,23 @@ pub struct StreamSender<T> {
 }
 
 impl<T: Serialize> StreamSender<T> {
-    async fn send_buffer(&self, buffer: BytesMut) {
+    fn send_buffer(&self, runtime: &Runtime, buffer: BytesMut) -> StrResult {
         match &self.socket {
-            StreamSendSocket::Udp(socket) => socket
-                .inner
-                .lock()
-                .await
-                .feed((buffer.freeze(), socket.peer_addr))
-                .await
-                .map_err(err!())
-                .ok(),
-            StreamSendSocket::Tcp(socket) => socket
-                .lock()
-                .await
-                .feed(buffer.freeze())
-                .await
-                .map_err(err!())
-                .ok(),
-        };
+            StreamSendSocket::Udp(socket) => runtime
+                .block_on(
+                    socket
+                        .inner
+                        .lock()
+                        .feed((buffer.freeze(), socket.peer_addr)),
+                )
+                .map_err(err!()),
+            StreamSendSocket::Tcp(socket) => runtime
+                .block_on(socket.lock().feed(buffer.freeze()))
+                .map_err(err!()),
+        }
     }
 
-    pub async fn send(&mut self, header: &T, payload_buffer: Vec<u8>) -> StrResult {
+    pub fn send(&mut self, runtime: &Runtime, header: &T, payload_buffer: Vec<u8>) -> StrResult {
         // packet layout:
         // [ 2B (stream ID) | 4B (packet index) | 4B (packet shard count) | 4B (shard index)]
         // this escluses length delimited coding, which is handled by the TCP backend
@@ -176,14 +171,17 @@ impl<T: Serialize> StreamSender<T> {
             shards_buffer.put_u32(total_shards_count as _);
             shards_buffer.put_u32(shard_index as u32);
             shards_buffer.put_slice(shard);
-            self.send_buffer(shards_buffer.split()).await;
+            self.send_buffer(runtime, shards_buffer.split())?;
         }
 
         match &self.socket {
-            StreamSendSocket::Udp(socket) => {
-                socket.inner.lock().await.flush().await.map_err(err!())?;
+            StreamSendSocket::Udp(socket) => runtime
+                .block_on(socket.inner.lock().flush())
+                .map_err(err!())?,
+
+            StreamSendSocket::Tcp(socket) => {
+                runtime.block_on(socket.lock().flush()).map_err(err!())?
             }
-            StreamSendSocket::Tcp(socket) => socket.lock().await.flush().await.map_err(err!())?,
         }
 
         self.next_packet_index += 1;
@@ -223,87 +221,87 @@ impl<T: DeserializeOwned> ReceiverBuffer<T> {
 }
 
 pub struct StreamReceiver<T> {
-    receiver: mpsc::UnboundedReceiver<BytesMut>,
-    next_packet_shards: HashMap<usize, BytesMut>,
-    next_packet_shards_count: Option<usize>,
-    next_packet_index: u32,
+    receiver: mpsc::Receiver<BytesMut>,
+    last_reconstructed_packet_index: u32,
+    packet_shards: BTreeMap<u32, HashMap<usize, BytesMut>>,
+    empty_shard_maps: Vec<HashMap<usize, BytesMut>>,
     _phantom: PhantomData<T>,
 }
 
-/// Get next packet reconstructing from shards. It can store at max shards from two packets; if the
-/// reordering entropy is too high, packets will never be successfully reconstructed.
+/// Get next packet reconstructing from shards.
+/// Returns true if a packet has been recontructed and copied into the buffer.
 impl<T: DeserializeOwned> StreamReceiver<T> {
-    pub async fn recv_buffer(&mut self, buffer: &mut ReceiverBuffer<T>) -> StrResult {
-        buffer.had_packet_loss = false;
+    pub fn recv_buffer(
+        &mut self,
+        timeout: Duration,
+        buffer: &mut ReceiverBuffer<T>,
+    ) -> ConResult<bool> {
+        // Get shard
+        let mut shard = match self.receiver.recv_timeout(timeout) {
+            Ok(shard) => Ok(shard),
+            Err(RecvTimeoutError::Timeout) => alvr_common::timeout(),
+            Err(RecvTimeoutError::Disconnected) => con_fmt_e!("Disconnected"),
+        }?;
+        let shard_packet_index = shard.get_u32();
+        let shards_count = shard.get_u32() as usize;
+        let shard_index = shard.get_u32() as usize;
 
-        loop {
-            let current_packet_index = self.next_packet_index;
-            self.next_packet_index += 1;
+        // Discard shard if too old
+        if shard_packet_index <= self.last_reconstructed_packet_index {
+            debug!("Received old shard!");
+            return Ok(false);
+        }
 
-            let mut current_packet_shards =
-                HashMap::with_capacity(self.next_packet_shards.capacity());
-            mem::swap(&mut current_packet_shards, &mut self.next_packet_shards);
+        // Insert shards into map
+        let shard_map = self
+            .packet_shards
+            .entry(shard_packet_index)
+            .or_insert_with(|| self.empty_shard_maps.pop().unwrap_or_default());
+        shard_map.insert(shard_index, shard);
 
-            let mut current_packet_shards_count = self.next_packet_shards_count.take();
+        // If the shard map is (probably) complete:
+        if shard_map.len() == shards_count {
+            buffer.inner.clear();
 
-            loop {
-                if let Some(shards_count) = current_packet_shards_count {
-                    if current_packet_shards.len() >= shards_count {
-                        buffer.inner.clear();
-
-                        for i in 0..shards_count {
-                            if let Some(shard) = current_packet_shards.get(&i) {
-                                buffer.inner.put_slice(shard);
-                            } else {
-                                error!("Cannot find shard with given index!");
-                                buffer.had_packet_loss = true;
-
-                                self.next_packet_shards.clear();
-
-                                break;
-                            }
-                        }
-
-                        return Ok(());
-                    }
+            // Copy shards into final buffer. Fail if there are missing shards. This is impossibly
+            // rare (if the shards_count value got corrupted) but should be handled.
+            for idx in 0..shards_count {
+                if let Some(shard) = shard_map.get(&idx) {
+                    buffer.inner.put_slice(shard);
+                } else {
+                    error!("Cannot find shard with given index!");
+                    return Ok(false);
                 }
-
-                let mut shard = self.receiver.recv().await.ok_or_else(enone!())?;
-
-                let shard_packet_index = shard.get_u32();
-                let shards_count = shard.get_u32() as usize;
-                let shard_index = shard.get_u32() as usize;
-
-                if shard_packet_index == current_packet_index {
-                    current_packet_shards.insert(shard_index, shard);
-                    current_packet_shards_count = Some(shards_count);
-                } else if shard_packet_index >= self.next_packet_index {
-                    if shard_packet_index > self.next_packet_index {
-                        self.next_packet_shards.clear();
-                    }
-
-                    self.next_packet_shards.insert(shard_index, shard);
-                    self.next_packet_shards_count = Some(shards_count);
-                    self.next_packet_index = shard_packet_index;
-
-                    if shard_packet_index > self.next_packet_index
-                        || self.next_packet_shards.len() == shards_count
-                    {
-                        debug!("Skipping to next packet. Signaling packet loss.");
-                        buffer.had_packet_loss = true;
-                        break;
-                    }
-                }
-                // else: ignore old shard
             }
+
+            // Check if current packet index is one up the last successful reconstucted packet.
+            buffer.had_packet_loss = shard_packet_index != self.last_reconstructed_packet_index + 1;
+            self.last_reconstructed_packet_index = shard_packet_index;
+
+            // Pop old shards and recycle containers
+            while let Some((packet_index, mut shards)) = self.packet_shards.pop_first() {
+                shards.clear();
+                self.empty_shard_maps.push(shards);
+
+                if packet_index == shard_packet_index {
+                    break;
+                }
+            }
+
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
-    pub async fn recv_header_only(&mut self) -> StrResult<T> {
+    pub fn recv_header_only(&mut self, timeout: Duration) -> ConResult<T> {
         let mut buffer = ReceiverBuffer::new();
-        self.recv_buffer(&mut buffer).await?;
 
-        Ok(buffer.get()?.0)
+        loop {
+            if self.recv_buffer(timeout, &mut buffer)? {
+                return Ok(buffer.get().map_err(to_con_e!())?.0);
+            }
+        }
     }
 }
 
@@ -313,31 +311,41 @@ pub enum StreamSocketBuilder {
 }
 
 impl StreamSocketBuilder {
-    pub async fn listen_for_server(
+    pub fn listen_for_server(
+        runtime: &Runtime,
         port: u16,
         stream_socket_config: SocketProtocol,
         send_buffer_bytes: SocketBufferSize,
         recv_buffer_bytes: SocketBufferSize,
     ) -> StrResult<Self> {
         Ok(match stream_socket_config {
-            SocketProtocol::Udp => StreamSocketBuilder::Udp(
-                udp::bind(port, send_buffer_bytes, recv_buffer_bytes).await?,
-            ),
-            SocketProtocol::Tcp => StreamSocketBuilder::Tcp(
-                tcp::bind(port, send_buffer_bytes, recv_buffer_bytes).await?,
-            ),
+            SocketProtocol::Udp => StreamSocketBuilder::Udp(udp::bind(
+                runtime,
+                port,
+                send_buffer_bytes,
+                recv_buffer_bytes,
+            )?),
+            SocketProtocol::Tcp => StreamSocketBuilder::Tcp(tcp::bind(
+                runtime,
+                port,
+                send_buffer_bytes,
+                recv_buffer_bytes,
+            )?),
         })
     }
 
-    pub async fn accept_from_server(
+    pub fn accept_from_server(
         self,
+        runtime: &Runtime,
+        timeout: Duration,
         server_ip: IpAddr,
         port: u16,
         max_packet_size: usize,
-    ) -> StrResult<StreamSocket> {
+    ) -> ConResult<StreamSocket> {
         let (send_socket, receive_socket) = match self {
             StreamSocketBuilder::Udp(socket) => {
-                let (send_socket, receive_socket) = udp::connect(socket, server_ip, port).await?;
+                let (send_socket, receive_socket) = udp::connect(socket, server_ip, port);
+
                 (
                     StreamSendSocket::Udp(send_socket),
                     StreamReceiveSocket::Udp(receive_socket),
@@ -345,7 +353,8 @@ impl StreamSocketBuilder {
             }
             StreamSocketBuilder::Tcp(listener) => {
                 let (send_socket, receive_socket) =
-                    tcp::accept_from_server(listener, server_ip).await?;
+                    tcp::accept_from_server(runtime, timeout, listener, server_ip)?;
+
                 (
                     StreamSendSocket::Tcp(send_socket),
                     StreamReceiveSocket::Tcp(receive_socket),
@@ -356,32 +365,43 @@ impl StreamSocketBuilder {
         Ok(StreamSocket {
             max_packet_size,
             send_socket,
-            receive_socket: Arc::new(Mutex::new(Some(receive_socket))),
-            packet_queues: Arc::new(Mutex::new(HashMap::new())),
+            receive_socket,
+            packet_queues: HashMap::new(),
         })
     }
 
-    pub async fn connect_to_client(
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_to_client(
+        runtime: &Runtime,
+        timeout: Duration,
         client_ip: IpAddr,
         port: u16,
         protocol: SocketProtocol,
         send_buffer_bytes: SocketBufferSize,
         recv_buffer_bytes: SocketBufferSize,
         max_packet_size: usize,
-    ) -> StrResult<StreamSocket> {
+    ) -> ConResult<StreamSocket> {
         let (send_socket, receive_socket) = match protocol {
             SocketProtocol::Udp => {
-                let socket = udp::bind(port, send_buffer_bytes, recv_buffer_bytes).await?;
-                let (send_socket, receive_socket) = udp::connect(socket, client_ip, port).await?;
+                let socket = udp::bind(runtime, port, send_buffer_bytes, recv_buffer_bytes)
+                    .map_err(to_con_e!())?;
+                let (send_socket, receive_socket) = udp::connect(socket, client_ip, port);
+
                 (
                     StreamSendSocket::Udp(send_socket),
                     StreamReceiveSocket::Udp(receive_socket),
                 )
             }
             SocketProtocol::Tcp => {
-                let (send_socket, receive_socket) =
-                    tcp::connect_to_client(client_ip, port, send_buffer_bytes, recv_buffer_bytes)
-                        .await?;
+                let (send_socket, receive_socket) = tcp::connect_to_client(
+                    runtime,
+                    timeout,
+                    client_ip,
+                    port,
+                    send_buffer_bytes,
+                    recv_buffer_bytes,
+                )?;
+
                 (
                     StreamSendSocket::Tcp(send_socket),
                     StreamReceiveSocket::Tcp(receive_socket),
@@ -392,8 +412,8 @@ impl StreamSocketBuilder {
         Ok(StreamSocket {
             max_packet_size,
             send_socket,
-            receive_socket: Arc::new(Mutex::new(Some(receive_socket))),
-            packet_queues: Arc::new(Mutex::new(HashMap::new())),
+            receive_socket,
+            packet_queues: HashMap::new(),
         })
     }
 }
@@ -401,42 +421,43 @@ impl StreamSocketBuilder {
 pub struct StreamSocket {
     max_packet_size: usize,
     send_socket: StreamSendSocket,
-    receive_socket: Arc<Mutex<Option<StreamReceiveSocket>>>,
-    packet_queues: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<BytesMut>>>>,
+    receive_socket: StreamReceiveSocket,
+    packet_queues: HashMap<u16, mpsc::Sender<BytesMut>>,
 }
 
 impl StreamSocket {
-    pub async fn request_stream<T>(&self, stream_id: u16) -> StrResult<StreamSender<T>> {
-        Ok(StreamSender {
+    pub fn request_stream<T>(&self, stream_id: u16) -> StreamSender<T> {
+        StreamSender {
             stream_id,
             max_packet_size: self.max_packet_size,
             socket: self.send_socket.clone(),
             header_buffer: vec![],
             next_packet_index: 0,
             _phantom: PhantomData,
-        })
+        }
     }
 
-    pub async fn subscribe_to_stream<T>(&self, stream_id: u16) -> StrResult<StreamReceiver<T>> {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        self.packet_queues.lock().await.insert(stream_id, sender);
+    pub fn subscribe_to_stream<T>(&mut self, stream_id: u16) -> StreamReceiver<T> {
+        let (sender, receiver) = mpsc::channel();
 
-        Ok(StreamReceiver {
+        self.packet_queues.insert(stream_id, sender);
+
+        StreamReceiver {
             receiver,
-            next_packet_shards: HashMap::new(),
-            next_packet_shards_count: None,
-            next_packet_index: 0,
+            last_reconstructed_packet_index: 0,
+            packet_shards: BTreeMap::new(),
+            empty_shard_maps: vec![],
             _phantom: PhantomData,
-        })
+        }
     }
 
-    pub async fn receive_loop(&self) -> StrResult {
-        match self.receive_socket.lock().await.take().unwrap() {
+    pub fn recv(&mut self, runtime: &Runtime, timeout: Duration) -> ConResult {
+        match &mut self.receive_socket {
             StreamReceiveSocket::Udp(socket) => {
-                udp::receive_loop(socket, Arc::clone(&self.packet_queues)).await
+                udp::recv(runtime, timeout, socket, &mut self.packet_queues)
             }
             StreamReceiveSocket::Tcp(socket) => {
-                tcp::receive_loop(socket, Arc::clone(&self.packet_queues)).await
+                tcp::recv(runtime, timeout, socket, &mut self.packet_queues)
             }
         }
     }

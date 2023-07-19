@@ -1,4 +1,15 @@
-use alvr_common::{once_cell::sync::Lazy, parking_lot::Mutex, prelude::*};
+#[cfg(windows)]
+mod windows;
+
+#[cfg(windows)]
+pub use crate::windows::*;
+
+use alvr_common::{
+    once_cell::sync::Lazy,
+    parking_lot::{Mutex, RwLock},
+    prelude::*,
+    RelaxedAtomic,
+};
 use alvr_session::{
     AudioBufferingConfig, CustomAudioDeviceConfig, LinuxAudioBackend, MicrophoneDevicesConfig,
 };
@@ -10,10 +21,11 @@ use cpal::{
 use rodio::{OutputStream, Source};
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{mpsc as smpsc, Arc},
+    sync::Arc,
     thread,
+    time::Duration,
 };
-use tokio::sync::mpsc as tmpsc;
+use tokio::runtime::Runtime;
 
 static VIRTUAL_MICROPHONE_PAIRS: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
     [
@@ -201,99 +213,20 @@ pub fn is_same_device(device1: &AudioDevice, device2: &AudioDevice) -> bool {
     }
 }
 
-#[cfg(windows)]
-fn get_windows_device(device: &AudioDevice) -> StrResult<windows::Win32::Media::Audio::IMMDevice> {
-    use widestring::U16CStr;
-    use windows::Win32::{
-        Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
-        Media::Audio::{eAll, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE},
-        System::Com::{self, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ},
-    };
-
-    let device_name = device.inner.name().map_err(err!())?;
-
-    unsafe {
-        // This will fail the second time is called, ignore the error
-        Com::CoInitializeEx(None, COINIT_MULTITHREADED).ok();
-
-        let imm_device_enumerator: IMMDeviceEnumerator =
-            Com::CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(err!())?;
-
-        let imm_device_collection = imm_device_enumerator
-            .EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE)
-            .map_err(err!())?;
-
-        let count = imm_device_collection.GetCount().map_err(err!())?;
-
-        for i in 0..count {
-            let imm_device = imm_device_collection.Item(i).map_err(err!())?;
-
-            let property_store = imm_device.OpenPropertyStore(STGM_READ).map_err(err!())?;
-
-            let mut prop_variant = property_store
-                .GetValue(&PKEY_Device_FriendlyName)
-                .map_err(err!())?;
-            let utf16_name =
-                U16CStr::from_ptr_str(prop_variant.Anonymous.Anonymous.Anonymous.pwszVal.0);
-            Com::StructuredStorage::PropVariantClear(&mut prop_variant).map_err(err!())?;
-
-            let imm_device_name = utf16_name.to_string().map_err(err!())?;
-            if imm_device_name == device_name {
-                return Ok(imm_device);
-            }
-        }
-
-        fmt_e!("No device found with specified name")
-    }
+#[derive(Clone)]
+pub enum AudioRecordState {
+    Recording,
+    ShouldStop,
+    Err(String),
 }
 
-#[cfg(windows)]
-pub fn get_windows_device_id(device: &AudioDevice) -> StrResult<String> {
-    use widestring::U16CStr;
-    use windows::Win32::System::Com;
-
-    unsafe {
-        let imm_device = get_windows_device(device)?;
-
-        let id_str_ptr = imm_device.GetId().map_err(err!())?;
-        let id_str = U16CStr::from_ptr_str(id_str_ptr.0)
-            .to_string()
-            .map_err(err!())?;
-        Com::CoTaskMemFree(Some(id_str_ptr.0 as _));
-
-        Ok(id_str)
-    }
-}
-
-// device must be an output device
-#[cfg(windows)]
-fn set_mute_windows_device(device: &AudioDevice, mute: bool) -> StrResult {
-    use windows::{
-        core::GUID,
-        Win32::{Media::Audio::Endpoints::IAudioEndpointVolume, System::Com::CLSCTX_ALL},
-    };
-
-    unsafe {
-        let imm_device = get_windows_device(device)?;
-
-        let endpoint_volume = imm_device
-            .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-            .map_err(err!())?;
-
-        endpoint_volume
-            .SetMute(mute, &GUID::zeroed())
-            .map_err(err!())?;
-    }
-
-    Ok(())
-}
-
-#[cfg_attr(not(windows), allow(unused_variables))]
-pub async fn record_audio_loop(
-    device: AudioDevice,
+#[allow(unused_variables)]
+pub fn record_audio_blocking(
+    runtime: Arc<RwLock<Option<Runtime>>>,
+    mut sender: StreamSender<()>,
+    device: &AudioDevice,
     channels_count: u16,
     mute: bool,
-    mut sender: StreamSender<()>,
 ) -> StrResult {
     let config = device
         .inner
@@ -316,95 +249,81 @@ pub async fn record_audio_loop(
         buffer_size: BufferSize::Default,
     };
 
-    // data_sender/receiver is the bridge between tokio and std thread
-    let (data_sender, mut data_receiver) = tmpsc::unbounded_channel::<StrResult<Vec<_>>>();
-    let (_shutdown_notifier, shutdown_receiver) = smpsc::channel::<()>();
+    let state = Arc::new(Mutex::new(AudioRecordState::Recording));
 
-    let thread_callback = {
-        let data_sender = data_sender.clone();
-        move || {
-            #[cfg(windows)]
-            if mute && device.is_output {
-                set_mute_windows_device(&device, true).ok();
-            }
+    let stream = device
+        .inner
+        .build_input_stream_raw(
+            &stream_config,
+            config.sample_format(),
+            {
+                let state = Arc::clone(&state);
+                let runtime = Arc::clone(&runtime);
+                move |data, _| {
+                    let data = if config.sample_format() == SampleFormat::F32 {
+                        data.bytes()
+                            .chunks_exact(4)
+                            .flat_map(|b| {
+                                f32::from_ne_bytes([b[0], b[1], b[2], b[3]])
+                                    .to_sample::<i16>()
+                                    .to_ne_bytes()
+                                    .to_vec()
+                            })
+                            .collect()
+                    } else {
+                        data.bytes().to_vec()
+                    };
 
-            let stream = device
-                .inner
-                .build_input_stream_raw(
-                    &stream_config,
-                    config.sample_format(),
-                    {
-                        let data_sender = data_sender.clone();
-                        move |data, _| {
-                            let data = if config.sample_format() == SampleFormat::F32 {
-                                data.bytes()
-                                    .chunks_exact(4)
-                                    .flat_map(|b| {
-                                        f32::from_ne_bytes([b[0], b[1], b[2], b[3]])
-                                            .to_sample::<i16>()
-                                            .to_ne_bytes()
-                                            .to_vec()
-                                    })
-                                    .collect()
-                            } else {
-                                data.bytes().to_vec()
-                            };
+                    let data = if config.channels() == 1 && channels_count == 2 {
+                        data.chunks_exact(2)
+                            .flat_map(|c| vec![c[0], c[1], c[0], c[1]])
+                            .collect()
+                    } else if config.channels() == 2 && channels_count == 1 {
+                        data.chunks_exact(4)
+                            .flat_map(|c| vec![c[0], c[1]])
+                            .collect()
+                    } else {
+                        data
+                    };
 
-                            let data = if config.channels() == 1 && channels_count == 2 {
-                                data.chunks_exact(2)
-                                    .flat_map(|c| vec![c[0], c[1], c[0], c[1]])
-                                    .collect()
-                            } else if config.channels() == 2 && channels_count == 1 {
-                                data.chunks_exact(4)
-                                    .flat_map(|c| vec![c[0], c[1]])
-                                    .collect()
-                            } else {
-                                data
-                            };
+                    if let Some(runtime) = &*runtime.read() {
+                        sender.send(runtime, &(), data).ok();
+                    } else {
+                        *state.lock() = AudioRecordState::ShouldStop;
+                    }
+                }
+            },
+            {
+                let state = Arc::clone(&state);
+                move |e| *state.lock() = AudioRecordState::Err(e.to_string())
+            },
+            None,
+        )
+        .map_err(err!())?;
 
-                            data_sender.send(Ok(data)).ok();
-                        }
-                    },
-                    {
-                        let data_sender = data_sender.clone();
-                        move |e| {
-                            data_sender
-                                .send(fmt_e!("Error while recording audio: {e}"))
-                                .ok();
-                        }
-                    },
-                    None,
-                )
-                .map_err(err!())?;
-
-            stream.play().map_err(err!())?;
-
-            shutdown_receiver.recv().ok();
-
-            #[cfg(windows)]
-            if mute && device.is_output {
-                set_mute_windows_device(&device, false).ok();
-            }
-
-            Ok(vec![])
-        }
-    };
-
-    // use a std thread to store the stream object. The stream object must be destroyed on the same
-    // thread of creation.
-    thread::spawn(move || {
-        let res = thread_callback();
-        if res.is_err() {
-            data_sender.send(res).ok();
-        }
-    });
-
-    // todo: reuse buffers also in the audio callback
-    while let Some(maybe_data) = data_receiver.recv().await {
-        sender.send(&(), maybe_data?).await.ok();
+    #[cfg(windows)]
+    if mute && device.is_output {
+        crate::windows::set_mute_windows_device(device, true).ok();
     }
 
-    Ok(())
+    let mut res = stream.play().map_err(err!());
+
+    if res.is_ok() {
+        while matches!(*state.lock(), AudioRecordState::Recording) && runtime.read().is_some() {
+            thread::sleep(Duration::from_millis(500))
+        }
+
+        if let AudioRecordState::Err(e) = state.lock().clone() {
+            res = Err(e);
+        }
+    }
+
+    #[cfg(windows)]
+    if mute && device.is_output {
+        set_mute_windows_device(device, false).ok();
+    }
+
+    res
 }
 
 // Audio callback. This is designed to be as less complex as possible. Still, when needed, this
@@ -441,7 +360,8 @@ pub fn get_next_frame_batch(
 // underflow, overflow, packet loss). In case the computation takes too much time, the audio
 // callback will gracefully handle an interruption, and the callback timing and sound wave
 // continuity will not be affected.
-pub async fn receive_samples_loop(
+pub fn receive_samples_loop(
+    running: Arc<RelaxedAtomic>,
     mut receiver: StreamReceiver<()>,
     sample_buffer: Arc<Mutex<VecDeque<f32>>>,
     channels_count: usize,
@@ -450,8 +370,13 @@ pub async fn receive_samples_loop(
 ) -> StrResult {
     let mut receiver_buffer = ReceiverBuffer::new();
     let mut recovery_sample_buffer = vec![];
-    loop {
-        receiver.recv_buffer(&mut receiver_buffer).await?;
+    while running.value() {
+        match receiver.recv_buffer(Duration::from_millis(500), &mut receiver_buffer) {
+            Ok(true) => (),
+            Ok(false) | Err(ConnectionError::Timeout) => continue,
+            Err(ConnectionError::Other(e)) => return fmt_e!("{e}"),
+        };
+
         let (_, packet) = receiver_buffer.get()?;
 
         let new_samples = packet
@@ -534,6 +459,8 @@ pub async fn receive_samples_loop(
             }
         }
     }
+
+    Ok(())
 }
 
 struct StreamingSource {
@@ -585,7 +512,8 @@ impl Iterator for StreamingSource {
     }
 }
 
-pub async fn play_audio_loop(
+pub fn play_audio_loop(
+    running: Arc<RelaxedAtomic>,
     device: AudioDevice,
     channels_count: u16,
     sample_rate: u32,
@@ -601,34 +529,28 @@ pub async fn play_audio_loop(
 
     let sample_buffer = Arc::new(Mutex::new(VecDeque::new()));
 
-    // Store the stream in a thread (because !Send)
-    let (_shutdown_notifier, shutdown_receiver) = smpsc::channel::<()>();
-    thread::spawn({
-        let sample_buffer = Arc::clone(&sample_buffer);
-        move || -> StrResult {
-            let (_stream, handle) = OutputStream::try_from_device(&device.inner).map_err(err!())?;
+    let (_stream, handle) = OutputStream::try_from_device(&device.inner).map_err(err!())?;
 
-            let source = StreamingSource {
-                sample_buffer,
-                current_batch: vec![],
-                current_batch_cursor: 0,
-                channels_count: channels_count as _,
-                sample_rate,
-                batch_frames_count,
-            };
-            handle.play_raw(source).map_err(err!())?;
-
-            shutdown_receiver.recv().ok();
-            Ok(())
-        }
-    });
+    handle
+        .play_raw(StreamingSource {
+            sample_buffer: Arc::clone(&sample_buffer),
+            current_batch: vec![],
+            current_batch_cursor: 0,
+            channels_count: channels_count as _,
+            sample_rate,
+            batch_frames_count,
+        })
+        .map_err(err!())?;
 
     receive_samples_loop(
+        running,
         receiver,
         sample_buffer,
         channels_count as _,
         batch_frames_count,
         average_buffer_frames_count,
     )
-    .await
+    .ok();
+
+    Ok(())
 }
