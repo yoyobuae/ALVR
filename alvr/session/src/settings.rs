@@ -729,6 +729,7 @@ pub struct HeadsetConfig {
 Local floor: the origin is on the floor and resets when long pressing the oculus button.
 Local: the origin resets when long pressing the oculus button, and is calculated as an offset from the current head position."#
     ))]
+    #[schema(flag = "real-time")]
     pub position_recentering_mode: PositionRecenteringMode,
 
     #[schema(strings(
@@ -736,6 +737,7 @@ Local: the origin resets when long pressing the oculus button, and is calculated
 Yaw: the forward direction is reset when long pressing the oculus button.
 Tilted: the world gets tilted when long pressing the oculus button. This is useful for using VR while laying down."#
     ))]
+    #[schema(flag = "real-time")]
     pub rotation_recentering_mode: RotationRecenteringMode,
 }
 
@@ -839,6 +841,9 @@ pub struct LoggingConfig {
     pub notification_level: LogSeverity,
     #[schema(flag = "real-time")]
     pub show_raw_events: bool,
+    #[schema(strings(help = "This applies only to certain error or warning messages."))]
+    #[schema(flag = "steamvr-restart")]
+    pub prefer_backtrace: bool,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -1245,6 +1250,7 @@ pub fn session_settings_default() -> SettingsDefault {
                 },
             },
             show_raw_events: false,
+            prefer_backtrace: false,
         },
         steamvr_launcher: SteamvrLauncherDefault {
             driver_launch_action: DriverLaunchActionDefault {
