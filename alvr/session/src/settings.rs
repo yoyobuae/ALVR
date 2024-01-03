@@ -184,6 +184,13 @@ VBR: Variable BitRate mode. Not commended because it may throw off the adaptive 
     #[schema(flag = "steamvr-restart")]
     pub filler_data: bool,
 
+    #[schema(strings(
+        display_name = "h264: Profile",
+        help = "Whenever possible, attempts to use this profile. May increase compatibility with varying mobile devices. Only has an effect for h264. Doesn't affect NVENC on Windows."
+    ))]
+    #[schema(flag = "steamvr-restart")]
+    pub h264_profile: H264Profile,
+
     #[schema(strings(help = r#"CAVLC algorithm is recommended.
 CABAC produces better compression but it's significantly slower and may lead to runaway latency"#))]
     #[schema(flag = "steamvr-restart")]
@@ -420,6 +427,18 @@ pub enum CodecType {
     Hevc = 1,
 }
 
+#[repr(u8)]
+#[derive(SettingsSchema, Serialize, Deserialize, Debug, Copy, Clone)]
+#[schema(gui = "button_group")]
+pub enum H264Profile {
+    #[schema(strings(display_name = "High"))]
+    High = 0,
+    #[schema(strings(display_name = "Main"))]
+    Main = 1,
+    #[schema(strings(display_name = "Baseline"))]
+    Baseline = 2,
+}
+
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 #[schema(collapsible)]
 pub struct VideoConfig {
@@ -447,7 +466,7 @@ pub struct VideoConfig {
     #[schema(
         strings(
             display_name = "Maximum buffering",
-            help = "Incresing this value will help reduce stutter but it will increase latency"
+            help = "Increasing this value will help reduce stutter but it will increase latency"
         ),
         gui(slider(min = 1.0, max = 10.0, step = 0.1, logarithmic)),
         suffix = " frames"
@@ -471,6 +490,11 @@ pub struct VideoConfig {
 
     #[schema(flag = "steamvr-restart")]
     pub encoder_config: EncoderConfig,
+
+    #[schema(strings(
+        help = "Attempts to use a software decoder on the device. Slow, but may work around broken codecs."
+    ))]
+    pub force_software_decoder: bool,
 
     pub mediacodec_extra_options: Vec<(String, MediacodecDataType)>,
 
@@ -1165,6 +1189,9 @@ pub fn session_settings_default() -> SettingsDefault {
                     variant: RateControlModeDefaultVariant::Cbr,
                 },
                 filler_data: false,
+                h264_profile: H264ProfileDefault {
+                    variant: H264ProfileDefaultVariant::High,
+                },
                 entropy_coding: EntropyCodingDefault {
                     variant: EntropyCodingDefaultVariant::Cavlc,
                 },
@@ -1272,6 +1299,7 @@ pub fn session_settings_default() -> SettingsDefault {
                     vertical_offset_deg: 0.0,
                 },
             },
+            force_software_decoder: false,
             color_correction: SwitchDefault {
                 enabled: true,
                 content: ColorCorrectionConfigDefault {
