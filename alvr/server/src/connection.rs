@@ -20,8 +20,8 @@ use alvr_common::{
     parking_lot::{Condvar, Mutex},
     settings_schema::Switch,
     warn, AnyhowToCon, ConResult, ConnectionError, ConnectionState, LifecycleState, OptLazy, ToCon,
-    BUTTON_INFO, CONTROLLER_PROFILE_INFO, DEVICE_ID_TO_PATH, HEAD_ID, LEFT_HAND_ID,
-    QUEST_CONTROLLER_PROFILE_PATH, RIGHT_HAND_ID,
+    BUTTON_INFO, CONTROLLER_PROFILE_INFO, DEVICE_ID_TO_PATH, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID,
+    QUEST_CONTROLLER_PROFILE_PATH,
 };
 use alvr_events::{ButtonEvent, EventType, HapticsEvent, TrackingEvent};
 use alvr_packets::{
@@ -30,7 +30,8 @@ use alvr_packets::{
     STATISTICS, TRACKING, VIDEO,
 };
 use alvr_session::{
-    BodyTrackingSinkConfig, ControllersEmulationMode, FrameSize, OpenvrConfig, SessionConfig,
+    BodyTrackingConfig, BodyTrackingSinkConfig, ControllersEmulationMode, FrameSize, OpenvrConfig,
+    SessionConfig,
 };
 use alvr_sockets::{
     PeerType, ProtoControlSocket, StreamSender, StreamSocketBuilder, KEEPALIVE_INTERVAL,
@@ -169,7 +170,7 @@ pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
         filler_data: settings.video.encoder_config.filler_data,
         entropy_coding: settings.video.encoder_config.entropy_coding as u32,
         use_10bit_encoder: settings.video.encoder_config.use_10bit,
-        // enable_pre_analysis: amf_controls.enable_pre_analysis,
+        enable_pre_analysis: amf_controls.enable_pre_analysis,
         enable_vbaq: amf_controls.enable_vbaq,
         enable_hmqb: amf_controls.enable_hmqb,
         use_preproc: amf_controls.use_preproc,
@@ -408,10 +409,10 @@ fn connection_pipeline(
             ClientListAction::SetDisplayName(display_name),
         );
 
-        if client_protocol_id != alvr_common::protocol_id() {
+        if client_protocol_id != alvr_common::protocol_id_u64() {
             warn!(
                 "Trusted client is incompatible! Expected protocol ID: {}, found: {}",
-                alvr_common::protocol_id(),
+                alvr_common::protocol_id_u64(),
                 client_protocol_id,
             );
 
@@ -783,10 +784,10 @@ fn connection_pipeline(
                     );
 
                     left_hand_skeleton = tracking.hand_skeletons[0].map(|s| {
-                        tracking::to_openvr_hand_skeleton(headset_config, *LEFT_HAND_ID, s)
+                        tracking::to_openvr_hand_skeleton(headset_config, *HAND_LEFT_ID, s)
                     });
                     right_hand_skeleton = tracking.hand_skeletons[1].map(|s| {
-                        tracking::to_openvr_hand_skeleton(headset_config, *RIGHT_HAND_ID, s)
+                        tracking::to_openvr_hand_skeleton(headset_config, *HAND_RIGHT_ID, s)
                     });
                 }
 
@@ -802,20 +803,12 @@ fn connection_pipeline(
                     let data_manager_lock = SERVER_DATA_MANAGER.read();
                     if data_manager_lock.settings().logging.log_tracking {
                         alvr_events::send_event(EventType::Tracking(Box::new(TrackingEvent {
-                            head_motion: motions
+                            device_motions: motions
                                 .iter()
-                                .find(|(id, _)| *id == *HEAD_ID)
-                                .map(|(_, m)| *m),
-                            controller_motions: [
-                                motions
-                                    .iter()
-                                    .find(|(id, _)| *id == *LEFT_HAND_ID)
-                                    .map(|(_, m)| *m),
-                                motions
-                                    .iter()
-                                    .find(|(id, _)| *id == *RIGHT_HAND_ID)
-                                    .map(|(_, m)| *m),
-                            ],
+                                .filter_map(|(id, motion)| {
+                                    Some(((*DEVICE_ID_TO_PATH.get(id)?).into(), *motion))
+                                })
+                                .collect(),
                             hand_skeletons: [left_hand_skeleton, right_hand_skeleton],
                             eye_gazes: local_eye_gazes,
                             fb_face_expression: tracking.face_data.fb_face_expression.clone(),
@@ -832,9 +825,19 @@ fn connection_pipeline(
                     sink.send_tracking(face_data);
                 }
 
-                if let Some(sink) = &mut body_tracking_sink {
-                    let tracking_manager_lock = tracking_manager.lock();
-                    sink.send_tracking(&tracking.device_motions, &tracking_manager_lock);
+                let track_body = {
+                    let data_manager_lock = SERVER_DATA_MANAGER.read();
+                    matches!(
+                        data_manager_lock.settings().headset.body_tracking,
+                        Switch::Enabled(BodyTrackingConfig { tracked: true, .. })
+                    )
+                };
+
+                if track_body {
+                    if let Some(sink) = &mut body_tracking_sink {
+                        let tracking_manager_lock = tracking_manager.lock();
+                        sink.send_tracking(&tracking.device_motions, &tracking_manager_lock);
+                    }
                 }
 
                 let ffi_motions = motions
@@ -844,7 +847,11 @@ fn connection_pipeline(
 
                 let ffi_body_trackers: Option<Vec<crate::FfiBodyTracker>> = {
                     let tracking_manager_lock = tracking_manager.lock();
-                    tracking::to_ffi_body_trackers(&tracking.device_motions, &tracking_manager_lock)
+                    tracking::to_ffi_body_trackers(
+                        &tracking.device_motions,
+                        &tracking_manager_lock,
+                        track_body,
+                    )
                 };
 
                 let enable_skeleton = controllers_config
@@ -872,11 +879,11 @@ fn connection_pipeline(
                     if let Some(hand_skeleton) = tracking.hand_skeletons[0] {
                         trigger_hand_gesture_actions(
                             gestures_button_mapping_manager,
-                            *LEFT_HAND_ID,
+                            *HAND_LEFT_ID,
                             &hand_gesture_manager_lock.get_active_gestures(
                                 hand_skeleton,
                                 gestures_config,
-                                *LEFT_HAND_ID,
+                                *HAND_LEFT_ID,
                             ),
                             gestures_config.only_touch,
                         );
@@ -884,11 +891,11 @@ fn connection_pipeline(
                     if let Some(hand_skeleton) = tracking.hand_skeletons[1] {
                         trigger_hand_gesture_actions(
                             gestures_button_mapping_manager,
-                            *RIGHT_HAND_ID,
+                            *HAND_RIGHT_ID,
                             &hand_gesture_manager_lock.get_active_gestures(
                                 hand_skeleton,
                                 gestures_config,
-                                *RIGHT_HAND_ID,
+                                *HAND_RIGHT_ID,
                             ),
                             gestures_config.only_touch,
                         );
