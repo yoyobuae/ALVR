@@ -23,10 +23,19 @@
 #include <map>
 #include <optional>
 
-void _SetChaperoneArea(float areaWidth, float areaHeight);
 #ifdef __linux__
-vr::HmdMatrix34_t GetRawZeroPose();
+#include "include/openvr_math.h"
+vr::HmdMatrix34_t GetInvZeroPose();
+
+vr::HmdMatrix34_t GetRawZeroPose() {
+    return vrmath::matInv33(GetInvZeroPose());
+}
+
+bool IsOpenvrClientReady();
 #endif
+void _SetChaperoneArea(float areaWidth, float areaHeight);
+
+vr::EVREventType VendorEvent_ALVRDriverResync = (vr::EVREventType) (vr::VREvent_VendorSpecific_Reserved_Start + ((vr::EVREventType) 0xC0));
 
 static void load_debug_privilege(void) {
 #ifdef _WIN32
@@ -210,12 +219,16 @@ class DriverProvider : public vr::IServerTrackedDeviceProvider {
                 HapticsSend(id, haptics.fDurationSeconds, haptics.fFrequency, haptics.fAmplitude);
             }
 #ifdef __linux__
-            else if (event.eventType == vr::VREvent_ChaperoneUniverseHasChanged) {
-                if (hmd && hmd->m_poseHistory) {
-                    InitOpenvrClient();
-                    hmd->m_poseHistory->SetTransformUpdating();
+            else if (event.eventType == vr::VREvent_ChaperoneUniverseHasChanged
+                || event.eventType == vr::VREvent_ChaperoneRoomSetupFinished
+                || event.eventType == vr::VREvent_ChaperoneFlushCache
+                || event.eventType == vr::VREvent_ChaperoneSettingsHaveChanged
+                || event.eventType == vr::VREvent_SeatedZeroPoseReset
+                || event.eventType == vr::VREvent_StandingZeroPoseReset
+                || event.eventType == vr::VREvent_SceneApplicationChanged
+                || event.eventType == VendorEvent_ALVRDriverResync) {
+                if (hmd && hmd->m_poseHistory && IsOpenvrClientReady()) {
                     hmd->m_poseHistory->SetTransform(GetRawZeroPose());
-                    ShutdownOpenvrClient();
                 }
             }
 #endif
@@ -242,6 +255,8 @@ const unsigned char *COMPRESS_AXIS_ALIGNED_CSO_PTR;
 unsigned int COMPRESS_AXIS_ALIGNED_CSO_LEN;
 const unsigned char *COLOR_CORRECTION_CSO_PTR;
 unsigned int COLOR_CORRECTION_CSO_LEN;
+const unsigned char *RGBTOYUV420_CSO_PTR;
+unsigned int RGBTOYUV420_CSO_LEN;
 
 const unsigned char *QUAD_SHADER_COMP_SPV_PTR;
 unsigned int QUAD_SHADER_COMP_SPV_LEN;
@@ -351,6 +366,13 @@ void VideoErrorReportReceive() {
     }
 }
 
+void RequestDriverResync() {
+    if (g_driver_provider.hmd) {
+        vr::VRServerDriverHost()->VendorSpecificEvent(
+            g_driver_provider.hmd->object_id, VendorEvent_ALVRDriverResync, {}, 0);
+    }
+}
+
 void ShutdownSteamvr() {
     if (g_driver_provider.hmd) {
         vr::VRServerDriverHost()->VendorSpecificEvent(
@@ -407,13 +429,6 @@ void SetButton(unsigned long long buttonID, FfiButtonValue value) {
 
 void SetChaperoneArea(float areaWidth, float areaHeight) {
     _SetChaperoneArea(areaWidth, areaHeight);
-
-#ifdef __linux__
-    if (g_driver_provider.hmd && g_driver_provider.hmd->m_poseHistory) {
-        g_driver_provider.hmd->m_poseHistory->SetTransformUpdating();
-        g_driver_provider.hmd->m_poseHistory->SetTransform(GetRawZeroPose());
-    }
-#endif
 }
 
 void CaptureFrame() {
@@ -423,3 +438,4 @@ void CaptureFrame() {
     }
 #endif
 }
+

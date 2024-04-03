@@ -7,6 +7,7 @@ use alvr_session::{CodecType, SessionConfig, Settings};
 use serde::{Deserialize, Serialize};
 use serde_json as json;
 use std::{
+    collections::HashSet,
     fmt::{self, Debug},
     net::IpAddr,
     path::PathBuf,
@@ -31,9 +32,12 @@ pub struct VideoStreamingCapabilitiesLegacy {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VideoStreamingCapabilities {
     pub default_view_resolution: UVec2,
-    pub supported_refresh_rates: Vec<f32>,
+    pub supported_refresh_rates: Vec<f32>, // todo rename
     pub microphone_sample_rate: u32,
-    pub supports_foveated_encoding: bool,
+    pub supports_foveated_encoding: bool, // todo rename
+    pub encoder_high_profile: bool,
+    pub encoder_10_bits: bool,
+    pub encoder_av1: bool,
 }
 
 // Nasty workaround to make the packet extensible, pushing the limits of protocol compatibility
@@ -84,6 +88,9 @@ pub fn decode_video_streaming_capabilities(
         supports_foveated_encoding: caps_json["supports_foveated_encoding"]
             .as_bool()
             .unwrap_or(true),
+        encoder_high_profile: caps_json["encoder_high_profile"].as_bool().unwrap_or(true),
+        encoder_10_bits: caps_json["encoder_10_bits"].as_bool().unwrap_or(true),
+        encoder_av1: caps_json["encoder_av1"].as_bool().unwrap_or(true),
     })
 }
 
@@ -192,6 +199,21 @@ pub enum ButtonValue {
 pub struct ButtonEntry {
     pub path_id: u64,
     pub value: ButtonValue,
+}
+
+// to be de/serialized with ClientControlPacket::Reserved()
+#[derive(Serialize, Deserialize)]
+pub enum ReservedClientControlPacket {
+    CustomInteractionProfile {
+        device_id: u64,
+        input_ids: HashSet<u64>,
+    },
+}
+
+pub fn encode_reserved_client_control_packet(
+    packet: &ReservedClientControlPacket,
+) -> ClientControlPacket {
+    ClientControlPacket::Reserved(json::to_string(packet).unwrap())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -343,4 +365,12 @@ pub enum ServerRequest {
     GetDriverList,
     RestartSteamvr,
     ShutdownSteamvr,
+}
+
+// Per eye view parameters
+// todo: send together with video frame
+#[derive(Serialize, Deserialize, Clone, Copy, Default)]
+pub struct ViewParams {
+    pub pose: Pose,
+    pub fov: Fov,
 }

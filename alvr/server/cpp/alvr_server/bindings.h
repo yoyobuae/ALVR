@@ -15,8 +15,8 @@ struct FfiQuat {
 };
 
 struct FfiHandSkeleton {
-    float jointPositions[26][3];
-    FfiQuat jointRotations[26];
+    float jointPositions[31][3];
+    FfiQuat jointRotations[31];
 };
 
 struct FfiDeviceMotion {
@@ -94,6 +94,9 @@ extern "C" const unsigned char *COMPRESS_AXIS_ALIGNED_CSO_PTR;
 extern "C" unsigned int COMPRESS_AXIS_ALIGNED_CSO_LEN;
 extern "C" const unsigned char *COLOR_CORRECTION_CSO_PTR;
 extern "C" unsigned int COLOR_CORRECTION_CSO_LEN;
+extern "C" const unsigned char *RGBTOYUV420_CSO_PTR;
+extern "C" unsigned int RGBTOYUV420_CSO_LEN;
+
 
 extern "C" const unsigned char *QUAD_SHADER_COMP_SPV_PTR;
 extern "C" unsigned int QUAD_SHADER_COMP_SPV_LEN;
@@ -147,6 +150,7 @@ extern "C" void SetTracking(unsigned long long targetTimestampNs,
                             const FfiBodyTracker *bodyTrackers,
                             int bodyTrackersCount);
 extern "C" void VideoErrorReportReceive();
+extern "C" void RequestDriverResync();
 extern "C" void ShutdownSteamvr();
 
 extern "C" void SetOpenvrProperty(unsigned long long deviceID, FfiOpenvrProperty prop);

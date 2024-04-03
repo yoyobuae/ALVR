@@ -26,12 +26,12 @@ use alvr_common::{
 use alvr_events::{ButtonEvent, EventType, HapticsEvent, TrackingEvent};
 use alvr_packets::{
     ClientConnectionResult, ClientControlPacket, ClientListAction, ClientStatistics, Haptics,
-    NegotiatedStreamingConfig, ServerControlPacket, Tracking, VideoPacketHeader, AUDIO, HAPTICS,
-    STATISTICS, TRACKING, VIDEO,
+    NegotiatedStreamingConfig, ReservedClientControlPacket, ServerControlPacket, Tracking,
+    VideoPacketHeader, AUDIO, HAPTICS, STATISTICS, TRACKING, VIDEO,
 };
 use alvr_session::{
-    BodyTrackingConfig, BodyTrackingSinkConfig, ControllersEmulationMode, FrameSize, OpenvrConfig,
-    SessionConfig,
+    BodyTrackingConfig, BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize,
+    H264Profile, OpenvrConfig, SessionConfig,
 };
 use alvr_sockets::{
     PeerType, ProtoControlSocket, StreamSender, StreamSocketBuilder, KEEPALIVE_INTERVAL,
@@ -170,6 +170,11 @@ pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
         filler_data: settings.video.encoder_config.filler_data,
         entropy_coding: settings.video.encoder_config.entropy_coding as u32,
         use_10bit_encoder: settings.video.encoder_config.use_10bit,
+        use_full_range_encoding: settings.video.encoder_config.use_full_range,
+        encoding_gamma: settings.video.encoder_config.encoding_gamma,
+        enable_hdr: settings.video.encoder_config.enable_hdr,
+        force_hdr_srgb_correction: settings.video.encoder_config.force_hdr_srgb_correction,
+        clamp_hdr_extended_range: settings.video.encoder_config.clamp_hdr_extended_range,
         enable_pre_analysis: amf_controls.enable_pre_analysis,
         enable_vbaq: amf_controls.enable_vbaq,
         enable_hmqb: amf_controls.enable_hmqb,
@@ -494,6 +499,50 @@ fn connection_pipeline(
         false
     };
 
+    let encoder_profile = if settings.video.encoder_config.h264_profile == H264Profile::High {
+        let profile = if streaming_caps.encoder_high_profile {
+            H264Profile::High
+        } else {
+            H264Profile::Main
+        };
+
+        if profile != H264Profile::High {
+            warn!("High profile encoding is not supported by the client.");
+        }
+
+        profile
+    } else {
+        settings.video.encoder_config.h264_profile
+    };
+
+    let enable_10_bits_encoding = if settings.video.encoder_config.use_10bit {
+        let enable = streaming_caps.encoder_10_bits;
+
+        if !enable {
+            warn!("10 bits encoding is not supported by the client.");
+        }
+
+        enable
+    } else {
+        false
+    };
+
+    let codec = if settings.video.preferred_codec == CodecType::AV1 {
+        let codec = if streaming_caps.encoder_av1 {
+            CodecType::AV1
+        } else {
+            CodecType::Hevc
+        };
+
+        if codec != CodecType::AV1 {
+            warn!("AV1 encoding is not supported by the client.");
+        }
+
+        codec
+    } else {
+        settings.video.preferred_codec
+    };
+
     let game_audio_sample_rate =
         if let Switch::Enabled(game_audio_config) = &settings.audio.game_audio {
             let game_audio_device = AudioDevice::new_output(
@@ -543,6 +592,9 @@ fn connection_pipeline(
     new_openvr_config.target_eye_resolution_height = target_view_resolution.y;
     new_openvr_config.refresh_rate = fps as _;
     new_openvr_config.enable_foveated_encoding = enable_foveated_encoding;
+    new_openvr_config.h264_profile = encoder_profile as _;
+    new_openvr_config.use_10bit_encoder = enable_10_bits_encoding;
+    new_openvr_config.codec = codec as _;
 
     if server_data_lock.session().openvr_config != new_openvr_config {
         server_data_lock.session_mut().openvr_config = new_openvr_config;
@@ -954,6 +1006,7 @@ fn connection_pipeline(
     let statistics_thread = thread::spawn({
         let client_hostname = client_hostname.clone();
         move || {
+            let mut _last_resync = Instant::now();
             while is_streaming(&client_hostname) {
                 let data = match statics_receiver.recv(STREAMING_RECV_TIMEOUT) {
                     Ok(stats) => stats,
@@ -967,7 +1020,10 @@ fn connection_pipeline(
                 if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
                     let timestamp = client_stats.target_timestamp;
                     let decoder_latency = client_stats.video_decode;
-                    let network_latency = stats.report_statistics(client_stats);
+                    let (network_latency, _game_latency) = stats.report_statistics(client_stats);
+
+                    #[cfg(target_os = "linux")]
+                    detect_desync(&_game_latency, &mut _last_resync);
 
                     let server_data_lock = SERVER_DATA_MANAGER.read();
                     BITRATE_MANAGER.lock().report_frame_latencies(
@@ -1026,7 +1082,10 @@ fn connection_pipeline(
         let control_sender = Arc::clone(&control_sender);
         let client_hostname = client_hostname.clone();
         move || {
-            unsafe { crate::InitOpenvrClient() };
+            unsafe {
+                crate::InitOpenvrClient();
+                crate::RequestDriverResync();
+            }
 
             let mut disconnection_deadline = Instant::now() + KEEPALIVE_TIMEOUT;
             while is_streaming(&client_hostname) {
@@ -1057,7 +1116,14 @@ fn connection_pipeline(
                             );
 
                             let area = packet.unwrap_or(Vec2::new(2.0, 2.0));
-                            unsafe { crate::SetChaperoneArea(area.x, area.y) };
+                            let wh = area.x * area.y;
+                            if wh.is_finite() && wh > 0.0 {
+                                info!("Received new playspace with size: {}", area);
+                                unsafe { crate::SetChaperoneArea(area.x, area.y) };
+                            } else {
+                                warn!("Received invalid playspace size: {}", area);
+                                unsafe { crate::SetChaperoneArea(2.0, 2.0) };
+                            }
                         }
                     }
                     ClientControlPacket::RequestIdr => {
@@ -1156,6 +1222,40 @@ fn connection_pipeline(
                     }
                     ClientControlPacket::Log { level, message } => {
                         info!("Client {client_hostname}: [{level:?}] {message}")
+                    }
+                    ClientControlPacket::Reserved(json_string) => {
+                        let reserved: ReservedClientControlPacket =
+                            match serde_json::from_str(&json_string) {
+                                Ok(reserved) => reserved,
+                                Err(e) => {
+                                    info!(
+                                    "Failed to parse reserved packet: {e}. Packet: {json_string}"
+                                );
+                                    continue;
+                                }
+                            };
+
+                        match reserved {
+                            ReservedClientControlPacket::CustomInteractionProfile {
+                                device_id: _,
+                                input_ids,
+                            } => {
+                                controller_button_mapping_manager = if let Switch::Enabled(config) =
+                                    &SERVER_DATA_MANAGER.read().settings().headset.controllers
+                                {
+                                    if let Some(mappings) = &config.button_mappings {
+                                        Some(ButtonMappingManager::new_manual(mappings))
+                                    } else {
+                                        Some(ButtonMappingManager::new_automatic(
+                                            &input_ids,
+                                            &config.button_mapping_config,
+                                        ))
+                                    }
+                                } else {
+                                    None
+                                };
+                            }
+                        }
                     }
                     _ => (),
                 }
@@ -1392,5 +1492,19 @@ pub extern "C" fn send_haptics(device_id: u64, duration_s: f32, frequency: f32, 
         sender
             .send_header(&haptics::map_haptics(&config, haptics))
             .ok();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_desync(game_latency: &Duration, last_resync: &mut Instant) {
+    if game_latency.as_secs_f32() > 0.25 {
+        let now = Instant::now();
+        if now.saturating_duration_since(*last_resync).as_secs_f32() > 0.1 {
+            *last_resync = now;
+            warn!("Desync detected. Attempting recovery.");
+            unsafe {
+                crate::RequestDriverResync();
+            }
+        }
     }
 }

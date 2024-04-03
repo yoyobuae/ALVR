@@ -57,7 +57,7 @@ pub fn prepare_ffmpeg_windows(deps_path: &Path) {
             "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/{}",
             "ffmpeg-n5.1-latest-win64-gpl-shared-5.1.zip"
         ),
-        &deps_path,
+        deps_path,
     )
     .unwrap();
 
@@ -111,7 +111,7 @@ pub fn build_x264_linux(deps_path: &Path) {
     // x264 0.164
     command::download_and_extract_tar(
         "https://code.videolan.org/videolan/x264/-/archive/c196240409e4d7c01b47448d93b1f9683aaa7cf7/x264-c196240409e4d7c01b47448d93b1f9683aaa7cf7.tar.bz2",
-        &deps_path,
+        deps_path,
     )
     .unwrap();
 
@@ -143,7 +143,7 @@ pub fn build_ffmpeg_linux(nvenc_flag: bool, deps_path: &Path) {
 
     command::download_and_extract_zip(
         "https://codeload.github.com/FFmpeg/FFmpeg/zip/n6.0",
-        &deps_path,
+        deps_path,
     )
     .unwrap();
 
@@ -242,6 +242,7 @@ pub fn build_ffmpeg_linux(nvenc_flag: bool, deps_path: &Path) {
             let nvenc_flags = &[
                 "--enable-encoder=h264_nvenc",
                 "--enable-encoder=hevc_nvenc",
+                "--enable-encoder=av1_nvenc",
                 "--enable-nonfree",
                 "--enable-cuda-nvcc",
                 "--enable-libnpp",
@@ -276,7 +277,10 @@ pub fn build_ffmpeg_linux(nvenc_flag: bool, deps_path: &Path) {
 
 fn get_android_openxr_loaders() {
     fn get_openxr_loader(name: &str, url: &str, source_dir: &str) {
+        let sh = Shell::new().unwrap();
         let temp_dir = afs::build_dir().join("temp_download");
+        sh.remove_path(&temp_dir).ok();
+        sh.create_dir(&temp_dir).unwrap();
         let destination_dir = afs::deps_dir().join("android_openxr/arm64-v8a");
         fs::create_dir_all(&destination_dir).unwrap();
 
